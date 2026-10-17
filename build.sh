@@ -2,13 +2,14 @@
 # Builds build/Disassembler.app; pass --install to replace /Applications/Disassembler.app.
 set -eu
 cd "$(dirname "$0")"
-swift build -c release --product Disassembler
+swift build -c release
 APP=build/Disassembler.app
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp "$(swift build -c release --show-bin-path)/Disassembler" "$APP/Contents/MacOS/"
+BIN="$(swift build -c release --show-bin-path)"
+cp "$BIN/Disassembler" "$BIN/disasm-mcp" "$APP/Contents/MacOS/"   # disasm-mcp: REA provider (see README)
 cp Info.plist "$APP/Contents/"
-cp Resources/AppIcon.icns "$APP/Contents/Resources/"
+cp Resources/AppIcon.icns Resources/rea-ida-mcp.json "$APP/Contents/Resources/"
 codesign --force --sign - "$APP"
 if [ "${1:-}" = "--install" ]; then
   rm -rf /Applications/Disassembler.app

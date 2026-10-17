@@ -7,6 +7,7 @@ let package = Package(
     targets: [
         .target(name: "DisasmCore"),
         .executableTarget(name: "Disassembler", dependencies: ["DisasmCore"]),
+        .executableTarget(name: "disasm-mcp", dependencies: ["DisasmCore"]),
         .testTarget(name: "DisasmCoreTests", dependencies: ["DisasmCore"]),
     ]
 )

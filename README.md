@@ -32,3 +32,25 @@ open -a Disassembler --args /path/to/YourApp.app [/path/to/crash.ips]
 ```
 
 Debugging works for apps you build yourself; macOS doesn't allow attaching to hardened or system apps.
+
+## Using it from REA (reverse-engineer-anything)
+
+The app bundles `disasm-mcp`, an MCP server that speaks the headless profile of
+[REA](https://github.com/morluto/rea)'s IDA provider, backed by this disassembler's engine. Point REA at the
+bundled registration and its native tools (`open_binary`, `analyze_function`, `procedure_assembly`, `xrefs`,
+string and procedure search, …) run on it:
+
+```sh
+claude mcp add-json rea '{"command":"npx","args":["-y","rea-agents@6.4.0","mcp"],
+  "env":{"REA_IDA_MCP_CONFIG":"/Applications/Disassembler.app/Contents/Resources/rea-ida-mcp.json"}}' -s user
+```
+
+REA selects it automatically for Mach-O targets, or explicitly with `provider_id: "ida"` (CLI: `--provider ida`).
+What to expect:
+
+- Results are labelled with REA's "IDA Pro MCP adapter" identity because they flow through that adapter;
+  the MCP `serverInfo` in each Evidence record says `disassembler-mcp`.
+- There is no decompiler. `procedure_pseudo_code` returns the function's **original source lines** from debug
+  info, headed "Not decompiled", or a one-line note when the build has no debug info. It never invents code.
+- REA's headless profile doesn't offer direct callers; use `xrefs` on the function address instead.
+- Mach-O only (arm64 slice preferred on Apple silicon). Use another REA provider for ELF or PE files.

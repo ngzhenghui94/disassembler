@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "ida-pro-mcp": {
+      "command": "/Applications/Disassembler.app/Contents/MacOS/disasm-mcp",
+      "args": [],
+      "mode": "headless"
+    }
+  }
+}
