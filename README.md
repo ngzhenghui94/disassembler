@@ -12,6 +12,11 @@ A Hopper-style macOS app for reading and debugging your own Mach-O apps.
   - local variables, registers (changes highlighted) and a memory viewer that takes addresses, registers or expressions
   - per-app launch arguments, environment variables and presets such as Zombie Objects and Malloc Scribble
 
+## Download
+
+Get the notarized build from [Releases](https://github.com/ngzhenghui94/disassembler/releases/latest), unzip it and
+move **Disassembler.app** to /Applications.
+
 ## Requirements
 
 macOS 14+ with Xcode (or the Command Line Tools) installed. Instruction decoding uses the system `otool`,
@@ -23,6 +28,7 @@ source lines use `atos`, and debugging uses LLDB's Python API.
 ./build.sh            # builds build/Disassembler.app
 ./build.sh --install  # also replaces /Applications/Disassembler.app
 swift test            # parser, crash report, source line, hex dump and LLDB tests
+scripts/release.sh    # Developer ID sign, notarize, staple, zip; add --publish for a GitHub release
 ```
 
 Open a binary from the app (⌘O), by dropping a file on the window, or from a terminal:
