@@ -45,6 +45,7 @@ public struct Section: Sendable, Hashable {
     public let segment, name: String
     public let addr, size: UInt64
     public let offset, flags: UInt32
+    public var reserved2: UInt32 = 0                         // stub size for symbol stub sections
     public var isCode: Bool { flags & 0x8000_0000 != 0 }   // S_ATTR_PURE_INSTRUCTIONS
     public var isCString: Bool { flags & 0xff == 0x2 }       // S_CSTRING_LITERALS
     public var fullName: String { "\(segment),\(name)" }
@@ -66,6 +67,7 @@ public struct MachO: Sendable {
     public private(set) var entry: UInt64?
     public private(set) var dylibs: [String] = []
     public private(set) var uuid: UUID?
+    public private(set) var binds: [UInt64: String] = [:]   // pointer slot -> imported symbol (chained fixups)
     let reader: Reader
 
     public var data: Data { reader.data }
@@ -140,6 +142,7 @@ public struct MachO: Sendable {
         var symtab: (symoff: Int, nsyms: Int, stroff: Int)?
         var starts: (off: Int, size: Int)?
         var entryOff: UInt64?
+        var fixups: (off: Int, size: Int)?
         for _ in 0..<ncmds {
             let cmd = try r.u32(off), size = Int(try r.u32(off + 4))
             guard size >= 8 else { throw MachOError(message: "Bad load command size") }
@@ -151,7 +154,7 @@ public struct MachO: Sendable {
                     let so = off + 72 + s * 80
                     sections.append(Section(segment: try r.fixedString(so + 16, 16), name: try r.fixedString(so, 16),
                                             addr: try r.u64(so + 32), size: try r.u64(so + 40),
-                                            offset: try r.u32(so + 48), flags: try r.u32(so + 64)))
+                                            offset: try r.u32(so + 48), flags: try r.u32(so + 64), reserved2: try r.u32(so + 72)))
                 }
             case 0x2: // LC_SYMTAB
                 symtab = (Int(try r.u32(off + 8)), Int(try r.u32(off + 12)), Int(try r.u32(off + 16)))
@@ -163,6 +166,8 @@ public struct MachO: Sendable {
                 if cmd != 0xd { dylibs.append(r.cString(off + Int(try r.u32(off + 8)))) }
             case 0x1b: // LC_UUID
                 uuid = try r.bytes(off + 8, 16).withUnsafeBytes { UUID(uuid: $0.loadUnaligned(as: uuid_t.self)) }
+            case 0x8000_0034: // LC_DYLD_CHAINED_FIXUPS
+                fixups = (Int(try r.u32(off + 8)), Int(try r.u32(off + 12)))
             default: break
             }
             off += size
@@ -191,6 +196,79 @@ public struct MachO: Sendable {
                 value = 0; shift = 0
             }
         }
+        if let fx = fixups { binds = (try? chainedBinds(fx.off)) ?? [:] }
+    }
+
+    /// Stub address -> the pointer slot it jumps through, decoded from __stubs/__auth_stubs (otool doesn't disassemble them).
+    public func stubSlots() -> [UInt64: UInt64] {
+        var result: [UInt64: UInt64] = [:]
+        for sec in sections where sec.isCode && sec.name.hasSuffix("stubs") && sec.name != "__objc_stubs" && sec.reserved2 > 0 {
+            let size = UInt64(sec.reserved2)
+            for k in 0..<(sec.size / size) {
+                let addr = sec.addr + k * size, off = Int(sec.offset) + Int(k * size)
+                if arch == "x86_64" {   // jmp *disp32(%rip)
+                    guard (try? reader.u16(off)) == 0x25ff, let disp = try? reader.u32(off + 2) else { continue }
+                    result[addr] = UInt64(bitPattern: Int64(bitPattern: addr + 6) &+ Int64(Int32(bitPattern: disp)))
+                    continue
+                }
+                guard let w0 = try? reader.u32(off), let w1 = try? reader.u32(off + 4), w0 & 0x9f00_0000 == 0x9000_0000 else { continue }
+                let pages = (w0 >> 5 & 0x7ffff) << 2 | w0 >> 29 & 3                 // 21-bit signed page delta
+                let imm = (Int64(Int32(bitPattern: pages << 11)) >> 11) << 12
+                let page = UInt64(bitPattern: Int64(bitPattern: addr & ~0xfff) &+ imm)
+                let imm12 = UInt64(w1 >> 10 & 0xfff)
+                if w1 & 0xffc0_0000 == 0x9100_0000 { result[addr] = page + imm12 }            // add x17, x17, #off
+                else if w1 & 0xffc0_0000 == 0xf940_0000 { result[addr] = page + imm12 * 8 }   // ldr x16, [x16, #off]
+            }
+        }
+        return result
+    }
+
+    /// Walks every chain in LC_DYLD_CHAINED_FIXUPS and records which slots bind to which import.
+    /// shortcut: rebases are left to `Analysis.derefTarget`'s heuristic; 32-bit and firmware pointer formats are skipped.
+    func chainedBinds(_ base: Int) throws -> [UInt64: String] {
+        let r = reader
+        let startsOff = base + Int(try r.u32(base + 4)), importsOff = base + Int(try r.u32(base + 8))
+        let symbolsOff = base + Int(try r.u32(base + 12)), importsCount = Int(try r.u32(base + 16)), format = try r.u32(base + 20)
+        var names: [String] = []
+        for i in 0..<min(importsCount, 1 << 20) {
+            let nameOff: Int
+            switch format {
+            case 1: nameOff = Int(try r.u32(importsOff + i * 4) >> 9)
+            case 2: nameOff = Int(try r.u32(importsOff + i * 8) >> 9)
+            case 3: nameOff = Int(try r.u64(importsOff + i * 16) >> 32)
+            default: return [:]
+            }
+            names.append(r.cString(symbolsOff + nameOff))
+        }
+        var result: [UInt64: String] = [:]
+        let segCount = Int(try r.u32(startsOff))
+        for s in 0..<min(segCount, segments.count) {
+            let infoOff = Int(try r.u32(startsOff + 4 + s * 4))
+            guard infoOff != 0 else { continue }
+            let info = startsOff + infoOff
+            let pageSize = Int(try r.u16(info + 4)), ptrFormat = try r.u16(info + 6), pageCount = Int(try r.u16(info + 20))
+            let arm64e = [1, 9, 12].contains(ptrFormat), is64 = [2, 6].contains(ptrFormat)
+            guard arm64e || is64 else { continue }
+            let seg = segments[s]
+            for p in 0..<pageCount {
+                let start = try r.u16(info + 22 + p * 2)
+                guard start != 0xffff else { continue }
+                var offInSeg = p * pageSize + Int(start)
+                for _ in 0..<(pageSize / 4 + 1) {   // a chain can't be longer than its page
+                    guard UInt64(offInSeg) + 8 <= seg.filesize else { break }
+                    let v = try r.u64(Int(seg.fileoff) + offInSeg)
+                    let isBind = arm64e ? v >> 62 & 1 == 1 : v >> 63 == 1
+                    if isBind {
+                        let ordinal = Int(v & (ptrFormat == 1 ? 0xffff : 0xff_ffff))
+                        if ordinal < names.count { result[seg.vmaddr + UInt64(offInSeg)] = names[ordinal] }
+                    }
+                    let next = arm64e ? Int(v >> 51 & 0x7ff) * 8 : Int(v >> 51 & 0xfff) * 4
+                    if next == 0 { break }
+                    offInSeg += next
+                }
+            }
+        }
+        return result
     }
 
     public func section(containing addr: UInt64) -> Section? {

@@ -6,6 +6,7 @@ import UniformTypeIdentifiers
 struct DisassemblerApp: App {
     @State private var doc = Document()
     @AppStorage("showBytes") private var showBytes = false
+    @AppStorage("showPseudocode") private var showPseudocode = false
 
     var body: some Scene {
         Window("Disassembler", id: "main") {
@@ -23,6 +24,7 @@ struct DisassemblerApp: App {
             }
             CommandGroup(after: .toolbar) {
                 Toggle("Show Instruction Bytes", isOn: $showBytes).keyboardShortcut("b", modifiers: [.command, .shift])
+                Toggle("Show Pseudocode", isOn: $showPseudocode).keyboardShortcut(.return, modifiers: .option)
             }
             CommandMenu("Navigate") {
                 Button("Back") { doc.back() }.keyboardShortcut("[").disabled(doc.history.isEmpty)
@@ -347,6 +349,7 @@ struct InfoSection: View {
 
 struct ProcedureView: View {
     @Environment(Document.self) private var doc
+    @AppStorage("showPseudocode") private var showPseudocode = false
     let analysis: Analysis
     let function: Function
     let focus: UInt64
@@ -356,7 +359,17 @@ struct ProcedureView: View {
         let headers = doc.sourceHeaders[function.start] ?? [:]
         VStack(alignment: .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: 4) {
-                Text(function.name).font(.headline.monospaced()).textSelection(.enabled).lineLimit(2)
+                HStack(alignment: .firstTextBaseline) {
+                    Text(function.name).font(.headline.monospaced()).textSelection(.enabled).lineLimit(2)
+                    Spacer()
+                    Picker("", selection: $showPseudocode) {
+                        Text("Assembly").tag(false)
+                        Text("Pseudocode").tag(true)
+                    }
+                    .pickerStyle(.segmented)
+                    .fixedSize()
+                    .help("Switch views (⌥↩)")
+                }
                 Text("\(hex(function.start)) – \(hex(function.end)) · \(function.lines.count) instructions")
                     .font(.caption.monospaced()).foregroundStyle(.secondary)
                 if !callers.isEmpty {
@@ -372,18 +385,78 @@ struct ProcedureView: View {
             }
             .padding(10)
             Divider()
-            ScrollViewReader { proxy in
-                List(analysis.instructions[function.lines]) { ins in
-                    InstructionRow(analysis: analysis, ins: ins, source: headers[ins.address],
-                                   isFocus: ins.address == focus && focus != function.start)
-                }
-                .listStyle(.plain)
-                .font(.system(.body, design: .monospaced))
-                .onAppear { proxy.scrollTo(focus, anchor: .center) }
-                .onChange(of: focus) { proxy.scrollTo(focus, anchor: .center) }
+            if showPseudocode {
+                PseudocodeView(analysis: analysis, function: function)
+            } else {
+                assembly(headers)
             }
         }
         .task(id: "\(function.start)-\(doc.debugInfoReady)") { await doc.loadSource(for: function) }
+    }
+
+    private func assembly(_ headers: [UInt64: SourceHeader]) -> some View {
+        ScrollViewReader { proxy in
+            List(analysis.instructions[function.lines]) { ins in
+                InstructionRow(analysis: analysis, ins: ins, source: headers[ins.address],
+                               isFocus: ins.address == focus && focus != function.start)
+            }
+            .listStyle(.plain)
+            .font(.system(.body, design: .monospaced))
+            .onAppear { proxy.scrollTo(focus, anchor: .center) }
+            .onChange(of: focus) { proxy.scrollTo(focus, anchor: .center) }
+        }
+    }
+}
+
+/// Decompiled pseudo-C for one procedure, computed off the main thread.
+struct PseudocodeView: View {
+    let analysis: Analysis
+    let function: Function
+    @State private var code: AttributedString?
+
+    var body: some View {
+        Group {
+            if let code {
+                ScrollView([.vertical, .horizontal]) {
+                    Text(code)
+                        .font(.system(.body, design: .monospaced))
+                        .textSelection(.enabled)
+                        .fixedSize()
+                        .frame(maxWidth: .infinity, alignment: .topLeading)
+                        .padding(12)
+                }
+            } else {
+                ProgressView("Decompiling…").frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .task(id: function.start) {
+            code = nil
+            let (a, f) = (analysis, function)
+            code = await Task.detached { Self.highlight(Decompiler.decompile(a, f)) }.value
+        }
+    }
+
+    nonisolated static func highlight(_ lines: [String]) -> AttributedString {
+        // Strings, comments, keywords, numbers: enough colour to read the structure at a glance.
+        let pattern = /"(?:[^"\\]|\\.)*"|@"(?:[^"\\]|\\.)*"|\/\/.*|\b(?:if|else|while|do|return|goto|break|continue|void|int64_t|super)\b|\b(?:0x[0-9a-f]+|\d+)\b|^loc_[0-9a-f]+:/
+        var out = AttributedString()
+        for (n, line) in lines.enumerated() {
+            var rest = Substring(line)
+            while let m = rest.firstMatch(of: pattern) {
+                out += AttributedString(String(rest[..<m.range.lowerBound]))
+                var token = AttributedString(String(m.output))
+                let t = m.output
+                token.foregroundColor = t.hasPrefix("\"") || t.hasPrefix("@\"") ? .red
+                    : t.hasPrefix("//") ? .secondary
+                    : t.first?.isNumber == true ? .blue
+                    : t.hasPrefix("loc_") ? .orange
+                    : .purple
+                out += token
+                rest = rest[m.range.upperBound...]
+            }
+            out += AttributedString(String(rest) + (n + 1 < lines.count ? "\n" : ""))
+        }
+        return out
     }
 }
 

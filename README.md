@@ -4,6 +4,8 @@ A Hopper-style macOS app for reading and debugging your own Mach-O apps.
 
 - **Disassembly** of arm64/x86_64 Mach-O files, fat binaries and `.app` bundles (including their frameworks and plugins)
 - **Procedures, imports, strings and cross-references**, with ADRP/selector/GOT references resolved
+- **Decompiler**: pseudo-C for any procedure (⌥↩), with recovered `if`/`else`, loops, call arguments,
+  string/CFString literals, imported symbols and Obj-C message sends written as `[receiver selector:arg]`
 - **Source lines** next to the assembly, from a `.dSYM` or a Debug build's debug map
 - **Crash reports**: open a `.ips` file and jump from each frame to the faulting instruction
 - **Live debugging** through LLDB:
@@ -56,7 +58,7 @@ What to expect:
 
 - Results are labelled with REA's "IDA Pro MCP adapter" identity because they flow through that adapter;
   the MCP `serverInfo` in each Evidence record says `disassembler-mcp`.
-- There is no decompiler. `procedure_pseudo_code` returns the function's **original source lines** from debug
-  info, headed "Not decompiled", or a one-line note when the build has no debug info. It never invents code.
+- `procedure_pseudo_code` returns the built-in decompiler's pseudo-C. When the build has debug info, the
+  function's original source lines follow it as a commented trailer.
 - REA's headless profile doesn't offer direct callers; use `xrefs` on the function address instead.
 - Mach-O only (arm64 slice preferred on Apple silicon). Use another REA provider for ELF or PE files.

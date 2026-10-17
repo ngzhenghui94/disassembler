@@ -57,9 +57,10 @@ import Testing
     #expect(asm["start_ea"] as? String == helperAddr && asm["name"] as? String == "_helper")
     #expect(((asm["lines"] as? [[String: Any]])?.count ?? 0) > 3 && (asmPage["cursor"] as? [String: Any])?["done"] as? Bool == true)
 
-    // "decompile" returns the real source lines, labelled as not decompiled.
+    // "decompile" returns pseudo-C followed by the real source lines from debug info.
     let code = try #require((try tool("decompile", db.merging(["addr": helperAddr, "offset": 0, "max_lines": 100]) { $1 }) as? [String: Any])?["code"] as? String)
-    #expect(code.hasPrefix("// Not decompiled: original source of _helper") && code.contains("int doubled = x * 2;"), "\(code)")
+    #expect(code.hasPrefix("int64_t helper(int64_t arg0) {") && code.contains("getenv(\"FIXTURE_MODE\")"), "\(code)")
+    #expect(code.contains("// Original source of _helper") && code.contains("int doubled = x * 2;"), "\(code)")
 
     // main calls puts (import) and tail-calls helper (internal).
     let mainAddr = try #require(fns.first { $0["name"] as? String == "_main" }?["addr"] as? String)

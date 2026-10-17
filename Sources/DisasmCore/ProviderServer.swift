@@ -21,7 +21,7 @@ public final class ProviderServer {
         ("list_funcs", "Page through functions."),
         ("lookup_funcs", "Resolve function names or addresses to their function."),
         ("find_regex", "Search strings in the binary with a regular expression."),
-        ("decompile", "No decompiler: returns the function's original source lines from debug info when available."),
+        ("decompile", "Decompile a function to pseudo-C; original source lines from debug info are appended when available."),
         ("disasm", "Disassemble a function."),
         ("callees", "Functions and imports a function calls."),
         ("xrefs_to", "Code and data references to an address."),
@@ -183,7 +183,7 @@ public final class ProviderServer {
         if let cached = s.pseudocode[f.start] {
             lines = cached
         } else {
-            lines = sourceListing(f, s)
+            lines = Decompiler.decompile(s.analysis, f) + sourceListing(f, s)
             s.pseudocode[f.start] = lines
             sessions[s.id] = s
         }
@@ -193,18 +193,15 @@ public final class ProviderServer {
                 "line_count": end - offset, "total_lines": lines.count] as [String: Any]
     }
 
-    /// There's no decompiler, so this returns what is real: the function's own source lines from debug info,
-    /// labelled as such, or a one-line note. It never invents code.
+    /// The function's own source lines from debug info, as a trailer to the pseudocode, or nothing.
     func sourceListing(_ f: Function, _ s: Session) -> [String] {
         let a = s.analysis
         let found = SourceLines.lookup(a.instructions[f.lines].map(\.address), debugInfo: s.debugInfo,
                                        arch: a.macho.arch, loadAddress: a.macho.textBase)
         let byFile = Dictionary(grouping: found.values, by: \.file)
-        guard let (file, refs) = byFile.max(by: { $0.value.count < $1.value.count }) else {
-            return ["// Pseudocode unavailable: Disassembler has no decompiler and \(f.name) has no debug line info. Use the assembly."]
-        }
+        guard let (file, refs) = byFile.max(by: { $0.value.count < $1.value.count }) else { return [] }
         let lo = refs.map(\.line).min()!, hi = refs.map(\.line).max()!
-        var out = ["// Not decompiled: original source of \(f.name) from debug info, \(file):\(lo)-\(hi)."]
+        var out = ["", "// Original source of \(f.name) from debug info, \(file):\(lo)-\(hi)."]
         if byFile.count > 1 {
             out.append("// Also contains code from: " + byFile.keys.filter { $0 != file }.sorted().joined(separator: ", "))
         }

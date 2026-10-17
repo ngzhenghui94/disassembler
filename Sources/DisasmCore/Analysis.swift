@@ -39,6 +39,7 @@ public struct Analysis: Sendable {
     public let imports: [Import]
     public let names: [UInt64: String]
     public let xrefs: [UInt64: [UInt64]]   // referenced address -> referencing instruction addresses
+    public let binds: [UInt64: String]     // GOT/pointer slot -> imported symbol, demangled
     let stringAt: [UInt64: String]
 
     public init(slice: ArchSlice) throws {
@@ -52,7 +53,7 @@ public struct Analysis: Sendable {
         }
         if let e = macho.entry, names[e] == nil { names[e] = "EntryPoint" }
 
-        var strings: [StringRef] = []
+        var strings: [StringRef] = [], empty: [UInt64] = []   // "" is referenced (e.g. @"") but not worth listing
         for sec in macho.sections where sec.isCString {
             guard let bytes = try? macho.reader.bytes(Int(sec.offset), Int(sec.size)) else { continue }
             var start = 0
@@ -60,12 +61,14 @@ public struct Analysis: Sendable {
                 if i > start {
                     strings.append(StringRef(address: sec.addr + UInt64(start),
                                              value: String(decoding: bytes[start..<i], as: UTF8.self), section: sec.name))
+                } else if i == 0 || bytes[i - 1] == 0 {
+                    empty.append(sec.addr + UInt64(i))
                 }
                 start = i + 1
             }
         }
         self.strings = strings
-        stringAt = Dictionary(strings.map { ($0.address, $0.value) }, uniquingKeysWith: { a, _ in a })
+        stringAt = Dictionary(strings.map { ($0.address, $0.value) } + empty.map { ($0, "") }, uniquingKeysWith: { a, _ in a })
 
         let symbolAddress = Dictionary(macho.symbols.map { ($0.name, $0.address) }, uniquingKeysWith: { a, _ in a })
         var ins = Self.parseOtool(try Self.otool(slice.data), symbolAddress)
@@ -73,8 +76,15 @@ public struct Analysis: Sendable {
         for i in ins where i.target != nil && i.comment.hasPrefix("symbol stub for: ") {
             stubs[i.target!] = String(i.comment.dropFirst("symbol stub for: ".count))
         }
+        for (stub, slot) in macho.stubSlots() where stubs[stub] == nil {
+            if let name = macho.binds[slot] { stubs[stub] = name }
+        }
+        let stubAddrs = Array(stubs.keys)
+        for (addr, name) in zip(stubAddrs, Self.demangle(stubAddrs.map { stubs[$0]! })) { stubs[addr] = name }
         imports = stubs.map { Import(name: $0.value, stub: $0.key) }.sorted { $0.name < $1.name }
         for (addr, name) in stubs where names[addr] == nil { names[addr] = name }
+        let slots = Array(macho.binds.keys)
+        binds = Dictionary(uniqueKeysWithValues: zip(slots, Self.demangle(slots.map { macho.binds[$0]! })))
         self.names = names
 
         // Function boundaries: symbols in code sections + LC_FUNCTION_STARTS + entry point.
@@ -108,9 +118,16 @@ public struct Analysis: Sendable {
             if let t = ins[i].target { xrefs[t, default: []].append(ins[i].address) }
             guard let ref = ins[i].dataRefs.first else { continue }
             var resolved = [ref]
-            if stringAt[ref] == nil, names[ref] == nil, let p = Self.derefTarget(macho, ref, stringAt, names) { resolved.append(p) }
+            if macho.section(containing: ref)?.name == "__cfstring" {
+                // CFString: { isa, flags, char *str, length }; otool can't follow chained fixups here.
+                if let p = Self.derefTarget(macho, ref + 16, stringAt, names), stringAt[p] != nil {
+                    resolved.append(p)
+                    if ins[i].comment.contains("bad cfstring ref") { ins[i].comment = "" }
+                }
+            } else if stringAt[ref] == nil, names[ref] == nil, let p = Self.derefTarget(macho, ref, stringAt, names) { resolved.append(p) }
             ins[i].dataRefs = resolved
             for r in resolved { xrefs[r, default: []].append(ins[i].address) }
+            if ins[i].comment.isEmpty, resolved.count == 1, let b = binds[ref] { ins[i].comment = "→ " + b }
             if ins[i].comment.isEmpty { ins[i].comment = Self.label(resolved.last!, macho, stringAt, names, via: resolved.count > 1) }
         }
         self.xrefs = xrefs
@@ -204,6 +221,8 @@ public struct Analysis: Sendable {
 
     /// Last operand is either `0x…` or, when symbols exist, `name` / `name+0x…`.
     static func branchTarget(_ operands: String, _ symbolAddress: [String: UInt64]) -> UInt64? {
+        // otool quotes names with characters like `$`, `:` or `[` (Obj-C stubs and methods): bl "_objc_msgSend$foo:"
+        if operands.hasSuffix("\""), let q = operands.dropLast().split(separator: "\"").last { return symbolAddress[String(q)] }
         guard !operands.contains(where: { "*([".contains($0) }),
               let last = operands.split(whereSeparator: { $0 == " " || $0 == "," }).last else { return nil }
         if last.hasPrefix("0x") { return UInt64(last.dropFirst(2), radix: 16) }
