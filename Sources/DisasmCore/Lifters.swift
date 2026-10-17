@@ -92,7 +92,11 @@ extension FunctionDecompiler {
         return v
     }
 
-    func callee(_ t: UInt64) -> Expr { .global(a.name(of: t)) }
+    func callee(_ t: UInt64) -> Expr {
+        let name = a.name(of: t)
+        calleeAddress[name] = t
+        return .global(name)
+    }
 
     func call(_ t: Expr) -> Stmt { Stmt(kind: .set(abi.ret, .call(t, [])), clobbers: abi.clobbered.filter { $0 != abi.ret }) }
 
@@ -210,10 +214,21 @@ extension FunctionDecompiler {
 
     /// `cmp a, b; ccmp c, d, #nzcv, cc1; b.cc2` is `a cc1 b && c cc2 d` (or `||` when nzcv satisfies cc2).
     /// The combined test is stored back into the flag pair in the shape the consumer's condition reads.
-    func liftConditionalCompare(_ ins: Instruction, _ ops: [String], next: Instruction?) -> [Stmt]? {
+    /// The encoding only answers cc2 and its complement, so every later reader of these flags must ask one of those.
+    func liftConditionalCompare(_ ins: Instruction, _ ops: [String], following: ArraySlice<Instruction>) -> [Stmt]? {
         guard ops.count == 4, let x = armOperand(ops, 0), var y = armOperand(ops, 1), let nzcv = Self.immediate(ops[2]),
-              let c1 = condition(ops[3]), let next, let cc2 = consumerCondition(next), let c2 = condition(cc2),
+              let c1 = condition(ops[3]), let next = following.first, let cc2 = consumerCondition(next), let c2 = condition(cc2),
               let holds = Self.nzcvSatisfies(cc2, nzcv) else { return nil }
+        let alias = ["cs": "hs", "cc": "lo"]
+        let complement = ["eq": "ne", "ne": "eq", "hs": "lo", "lo": "hs", "hi": "ls", "ls": "hi", "ge": "lt", "lt": "ge", "gt": "le", "le": "gt"]
+        let asked = alias[cc2] ?? cc2
+        let flagWriters: Set<String> = ["cmp", "cmn", "tst", "fcmp", "fcmpe", "adds", "subs", "ands", "bics", "negs", "ngcs", "adcs", "sbcs",
+                                        "ccmp", "ccmn", "fccmp", "fccmpe"]
+        for later in following.prefix(64) {
+            let m = later.mnemonic
+            if let cc = consumerCondition(later).map({ alias[$0] ?? $0 }), cc != asked, cc != complement[asked] { return nil }
+            if flagWriters.contains(m) || m.hasPrefix("bl") || ["b", "br", "braa", "brab", "ret", "retaa", "retab"].contains(m) { break }
+        }
         if ins.mnemonic == "ccmn" { y = .un("-", y) }
         let test = c2.map { $0 == .v("cmp_l") ? x : $0 == .v("cmp_r") ? y : $0 }
         let result: Expr = holds ? .bin("||", negate(c1), test) : .bin("&&", c1, test)
@@ -284,7 +299,7 @@ extension FunctionDecompiler {
         return stmts + [Stmt(kind: .branch(.raw("__asm_condition(\"\(ins.mnemonic)\")"), t))]
     }
 
-    func liftARM(_ ins: Instruction, next: Instruction?) -> [Stmt] {
+    func liftARM(_ ins: Instruction, following: ArraySlice<Instruction>) -> [Stmt] {
         let m = ins.mnemonic
         let ops = Self.splitOperands(ins.operands)
         let regsUsed = ops.flatMap { $0.split(whereSeparator: { " [],!".contains($0) }) }.compactMap { armReg(String($0)) }.filter { $0 != "zr" }
@@ -338,7 +353,8 @@ extension FunctionDecompiler {
         case "adr":
             if let e = refAddress(ins) { return set(e) }
             guard ops.count > 1, let t = Self.immediate(ops[1]) else { return fallback() }
-            return set(addrExpr(UInt64(bitPattern: t)))
+            // otool prints `adr x10, #16`: an offset from this instruction, not an address.
+            return set(addrExpr(ins.address &+ UInt64(bitPattern: t)))
         case "mov", "movz", "fmov":
             guard let s = op(1) else { return fallback() }
             if d == abi.fp, s == .v("sp") { return [] }
@@ -435,7 +451,7 @@ extension FunctionDecompiler {
             return set(e) + (setsFlags ? flags(result, .c(0)) : [])
         default:
             if ["ccmp", "ccmn", "fccmp", "fccmpe"].contains(m) {
-                return liftConditionalCompare(ins, ops, next: next) ?? asm(ins, defs: ABI.flags, uses: regsUsed + ABI.flags)
+                return liftConditionalCompare(ins, ops, following: following) ?? asm(ins, defs: ABI.flags, uses: regsUsed + ABI.flags)
             }
             if let dot = m.firstIndex(of: "."), ["mov", "movi", "fmov"].contains(m[..<dot]), ops.count == 2, let s = op(1) {
                 return set(s)   // whole-register vector moves and splats of 0

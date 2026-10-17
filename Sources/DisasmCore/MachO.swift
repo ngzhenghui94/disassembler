@@ -68,6 +68,7 @@ public struct MachO: Sendable {
     public private(set) var dylibs: [String] = []
     public private(set) var uuid: UUID?
     public private(set) var binds: [UInt64: String] = [:]   // pointer slot -> imported symbol (chained fixups)
+    public private(set) var dataInCode: [(addr: UInt64, length: Int, fileOffset: Int)] = []   // jump tables etc. inside __text
     let reader: Reader
 
     public var data: Data { reader.data }
@@ -143,6 +144,7 @@ public struct MachO: Sendable {
         var starts: (off: Int, size: Int)?
         var entryOff: UInt64?
         var fixups: (off: Int, size: Int)?
+        var dic: (off: Int, size: Int)?
         for _ in 0..<ncmds {
             let cmd = try r.u32(off), size = Int(try r.u32(off + 4))
             guard size >= 8 else { throw MachOError(message: "Bad load command size") }
@@ -166,6 +168,8 @@ public struct MachO: Sendable {
                 if cmd != 0xd { dylibs.append(r.cString(off + Int(try r.u32(off + 8)))) }
             case 0x1b: // LC_UUID
                 uuid = try r.bytes(off + 8, 16).withUnsafeBytes { UUID(uuid: $0.loadUnaligned(as: uuid_t.self)) }
+            case 0x29: // LC_DATA_IN_CODE: { u32 fileoff, u16 length, u16 kind } entries
+                dic = (Int(try r.u32(off + 8)), Int(try r.u32(off + 12)))
             case 0x8000_0034: // LC_DYLD_CHAINED_FIXUPS
                 fixups = (Int(try r.u32(off + 8)), Int(try r.u32(off + 12)))
             default: break
@@ -197,6 +201,13 @@ public struct MachO: Sendable {
             }
         }
         if let fx = fixups { binds = (try? chainedBinds(fx.off)) ?? [:] }
+        if let d = dic {
+            for i in 0..<min(d.size / 8, 1 << 20) {
+                guard let fileOff = try? r.u32(d.off + i * 8), let length = try? r.u16(d.off + i * 8 + 4),
+                      let seg = segments.first(where: { UInt64(fileOff) >= $0.fileoff && UInt64(fileOff) < $0.fileoff + $0.filesize }) else { continue }
+                dataInCode.append((seg.vmaddr + UInt64(fileOff) - seg.fileoff, Int(length), Int(fileOff)))
+            }
+        }
     }
 
     /// Stub address -> the pointer slot it jumps through, decoded from __stubs/__auth_stubs (otool doesn't disassemble them).
@@ -273,6 +284,12 @@ public struct MachO: Sendable {
 
     public func section(containing addr: UInt64) -> Section? {
         sections.first { addr >= $0.addr && addr < $0.addr + $0.size }
+    }
+
+    /// Bytes at a VM address, if they are backed by file data.
+    public func bytes(at addr: UInt64, _ count: Int) -> Data? {
+        guard count >= 0, let seg = segments.first(where: { addr >= $0.vmaddr && addr - $0.vmaddr + UInt64(count) <= $0.filesize }) else { return nil }
+        return try? reader.bytes(Int(truncatingIfNeeded: seg.fileoff &+ (addr - seg.vmaddr)), count)
     }
 
     /// Reads a pointer-sized value at a VM address, if it is backed by file data.

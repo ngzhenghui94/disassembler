@@ -4,7 +4,8 @@ A Hopper-style macOS app for reading and debugging your own Mach-O apps.
 
 - **Disassembly** of arm64/x86_64 Mach-O files, fat binaries and `.app` bundles (including their frameworks and plugins)
 - **Procedures, imports, strings and cross-references**, with ADRP/selector/GOT references resolved
-- **Decompiler**: pseudo-C for any procedure (⌥↩), with recovered `if`/`else`, loops, call arguments,
+- **Decompiler**: pseudo-C for any procedure (⌥↩), with recovered `if`/`else`, loops, `switch` statements
+  from jump tables, call arguments (from known C/runtime signatures and each callee's own parameters),
   string/CFString literals, imported symbols and Obj-C message sends written as `[receiver selector:arg]`
 - **Source lines** next to the assembly, from a `.dSYM` or a Debug build's debug map
 - **Crash reports**: open a `.ips` file and jump from each frame to the faulting instruction

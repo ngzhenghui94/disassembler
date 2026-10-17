@@ -67,6 +67,7 @@ struct Stmt {
         case jump(UInt64)
         case branch(Expr, UInt64)
         case ijump(Expr)
+        case switchJump(Expr, [UInt64], UInt64?)   // jump table: case k goes to targets[k]; then the default
         case halt(String)
         case asm(String)
     }
@@ -77,7 +78,7 @@ struct Stmt {
     var defs: [String] { if case .set(let n, _) = kind { [n] + clobbers } else { clobbers } }
     var uses: [String] {
         switch kind {
-        case .set(_, let e), .eval(let e), .branch(let e, _), .ijump(let e): e.vars
+        case .set(_, let e), .eval(let e), .branch(let e, _), .ijump(let e), .switchJump(let e, _, _): e.vars
         case .store(let a, let v, _): a.vars + v.vars
         case .ret(let e): (e?.vars ?? []) + asmUses
         case .asm: asmUses
@@ -86,7 +87,7 @@ struct Stmt {
     }
     var exprs: [Expr] {
         switch kind {
-        case .set(_, let e), .eval(let e), .branch(let e, _), .ijump(let e): [e]
+        case .set(_, let e), .eval(let e), .branch(let e, _), .ijump(let e), .switchJump(let e, _, _): [e]
         case .store(let a, let v, _): [a, v]
         case .ret(let e): e.map { [$0] } ?? []
         default: []
@@ -100,13 +101,14 @@ struct Stmt {
         case .eval(let e): s.kind = .eval(e.map(f))
         case .branch(let e, let t): s.kind = .branch(e.map(f), t)
         case .ijump(let e): s.kind = .ijump(e.map(f))
+        case .switchJump(let e, let t, let d): s.kind = .switchJump(e.map(f), t, d)
         case .ret(let e): s.kind = .ret(e?.map(f))
         default: break
         }
         return s
     }
     var isTerminator: Bool {
-        switch kind { case .jump, .branch, .ret, .ijump, .halt: true; default: false }
+        switch kind { case .jump, .branch, .ret, .ijump, .switchJump, .halt: true; default: false }
     }
     var writesMemory: Bool {
         switch kind {
@@ -156,18 +158,56 @@ final class FunctionDecompiler {
     var index: [UInt64: Int] = [:]
     var frameSaves = Set<UInt64>()
 
-    init(_ a: Analysis, _ f: Function) {
+    /// `light` decompilers only discover parameters, for their callers; they don't look at their own callees.
+    let light: Bool
+    var calleeAddress: [String: UInt64] = [:]
+    let extraLeaders: Set<UInt64>        // jump-table targets found by an earlier pass
+    var missingLeaders = Set<UInt64>()
+
+    init(_ a: Analysis, _ f: Function, light: Bool = false, extraLeaders: Set<UInt64> = []) {
         self.a = a
         self.f = f
+        self.light = light
+        self.extraLeaders = extraLeaders
         isARM = a.macho.arch.hasPrefix("arm64")
         abi = isARM ? .arm64 : .x86_64
     }
 
     func run() -> [String] {
+        var (paramCount, returnsValue) = prepare()
+        copyFlagsIntoSuccessors()
+        optimize()
+        let recovered = recoverSwitches()
+        if convertIndirectTailCalls(paramCount) { optimize() }
+        if recovered {
+            // Case bodies are reachable now, and may read incoming arguments nothing else did.
+            let live = liveness(conservative: false).liveIn[0]
+            let more = ((abi.args.indices.filter { live.contains(abi.args[$0]) }.max() ?? -1) + 1)
+            if more > paramCount {
+                blocks[0].stmts.insert(contentsOf: (paramCount..<more).map { Stmt(kind: .set(abi.args[$0], .v("arg\($0)"))) }, at: 0)
+                paramCount = more
+            }
+            optimize()
+        }
+        if !missingLeaders.isEmpty, extraLeaders.isEmpty {
+            // A case starts mid-block (C fallthrough): start over with the case addresses as block boundaries.
+            return FunctionDecompiler(a, f, extraLeaders: missingLeaders).run()
+        }
+        while simplifyCFG() { optimize() }
+
+        let args = (0..<paramCount).map { "int64_t arg\($0)" }.joined(separator: ", ")
+        var out = ["\(returnsValue ? "int64_t" : "void") \(pretty(f.name))(\(args)) {"]
+        out += structure()
+        out.append("}")
+        return out
+    }
+
+    /// Lifting through parameter discovery; also how a caller learns how many arguments this function takes.
+    func prepare() -> (paramCount: Int, returnsValue: Bool) {
         let insns = Array(a.instructions[f.lines])
         if isARM { frameSaves = computeFrameSaves(insns) }
         let lifted = insns.indices.map { k in
-            isARM ? liftARM(insns[k], next: k + 1 < insns.count ? insns[k + 1] : nil) : liftX86(insns[k], prev: k > 0 ? insns[k - 1] : nil)
+            isARM ? liftARM(insns[k], following: insns[(k + 1)...]) : liftX86(insns[k], prev: k > 0 ? insns[k - 1] : nil)
         }
         buildBlocks(insns, lifted)
         canonicalizeStackAddresses()
@@ -185,8 +225,12 @@ final class FunctionDecompiler {
             for s in blocks[b].stmts.indices {
                 guard case .ret(nil) = blocks[b].stmts[s].kind else { continue }
                 if returnsValue { blocks[b].stmts[s].kind = .ret(.v(retReg)) }
-                // The other result registers stay live so a struct or float result isn't deleted as dead.
-                blocks[b].stmts[s].asmUses = abi.otherRets.filter { $0 != retReg && assigns($0) }
+                // The other result registers stay live so a struct or float result isn't deleted as dead: float ones
+                // when the function writes them at all, the integer second half only when set on the way out.
+                let setHere = Set(blocks[b].stmts[..<s].compactMap { st -> String? in if case .set(let n, _) = st.kind { n } else { nil } })
+                blocks[b].stmts[s].asmUses = abi.otherRets.filter { r in
+                    r != retReg && (r == abi.otherRets[0] ? setHere.contains(r) : assigns(r))
+                }
             }
         }
         if !blocks[0].preds.isEmpty {
@@ -198,20 +242,12 @@ final class FunctionDecompiler {
         let params = abi.args.indices.filter { entryLive.contains(abi.args[$0]) }
         let paramCount = (params.max() ?? -1) + 1
         blocks[0].stmts.insert(contentsOf: (0..<paramCount).map { Stmt(kind: .set(abi.args[$0], .v("arg\($0)"))) }, at: 0)
-        copyFlagsIntoSuccessors()
-        optimize()
-        while simplifyCFG() { optimize() }
-
-        let args = (0..<paramCount).map { "int64_t arg\($0)" }.joined(separator: ", ")
-        var out = ["\(returnsValue ? "int64_t" : "void") \(pretty(f.name))(\(args)) {"]
-        out += structure()
-        out.append("}")
-        return out
+        return (paramCount, returnsValue)
     }
 
     func buildBlocks(_ insns: [Instruction], _ lifted: [[Stmt]]) {
         let addrs = Set(insns.map(\.address))
-        var leaders: Set<UInt64> = [insns[0].address]
+        var leaders: Set<UInt64> = extraLeaders.intersection(addrs).union([insns[0].address])
         for (k, stmts) in lifted.enumerated() {
             for s in stmts {
                 switch s.kind {
@@ -239,6 +275,7 @@ final class FunctionDecompiler {
             switch blocks[i].stmts.last?.kind {
             case .jump(let t)?: blocks[i].succs = index[t].map { [$0] } ?? []
             case .branch(_, let t)?: blocks[i].succs = Array(Set((index[t].map { [$0] } ?? []) + next))
+            case .switchJump(_, let t, let d)?: blocks[i].succs = Array(Set((t + (d.map { [$0] } ?? [])).compactMap { index[$0] })).sorted()
             case .ret?, .ijump?, .halt?: blocks[i].succs = []
             default: blocks[i].succs = next
             }
@@ -283,7 +320,7 @@ final class FunctionDecompiler {
         var merged = false
         var i = blocks.count - 2
         while i >= 0 {
-            let branches: Bool = if case .branch? = blocks[i].stmts.last?.kind { true } else { false }
+            let branches: Bool = switch blocks[i].stmts.last?.kind { case .branch?, .switchJump?: true; default: false }
             if blocks[i].succs == [i + 1], blocks[i + 1].preds == [i], !branches {
                 if case .jump? = blocks[i].stmts.last?.kind { blocks[i].stmts.removeLast() }
                 blocks[i].stmts += blocks[i + 1].stmts
@@ -314,6 +351,136 @@ final class FunctionDecompiler {
         }
     }
 
+    /// Turns `goto *(base + table[i] << k)` into a switch when the table, its size and its targets check out.
+    func recoverSwitches() -> Bool {
+        var changed = false
+        for b in blocks.indices {
+            guard case .ijump(let raw)? = blocks[b].stmts.last?.kind else { continue }
+            let values = blockValues(b)
+            let e = simplify(raw.map { if case .v(let n) = $0, let v = values[n] { v } else { $0 } })
+            guard var table = matchJumpTable(e) else { continue }
+            // arm64e clamps the index (`csel x16, x16, xzr, ls`) against speculation; in range it's the index itself.
+            // The clamp's bound is also the table size when there's no separate range check (Swift enum switches).
+            var clampCount: Int?
+            if case .ite(let c, let x, .c(0)) = table.index {
+                table.index = x
+                if case .bin(let op, x, .c(let n)) = c, n >= 0, n < 4096, op == "<=" || op == "<" { clampCount = Int(n) + (op == "<=" ? 1 : 0) }
+            }
+            let dic = a.macho.dataInCode.first { $0.addr == table.addr }.map { $0.length / table.size }
+            // Without a range check or a data-in-code length, only x86 tables are safe to scan (any arm64 word is aligned).
+            let guardInfo = rangeGuard(b, table.index)
+            guard let count = guardInfo?.count ?? clampCount ?? dic ?? (isARM ? nil : 256) else { continue }
+            var targets: [UInt64] = []
+            for k in 0..<min(count, 4096) {
+                guard let bytes = a.macho.bytes(at: table.addr + UInt64(k * table.size), table.size) else { break }
+                let entry: Int64 = bytes.withUnsafeBytes { p in
+                    switch table.size { case 1: Int64(p.load(as: UInt8.self)); case 2: Int64(p.loadUnaligned(as: UInt16.self)); default: Int64(p.loadUnaligned(as: Int32.self)) }
+                }
+                let t = UInt64(bitPattern: table.base &+ (entry << table.shift))
+                if index[t] == nil {
+                    guard inside(t), a.instruction(at: t) != nil else { break }
+                    missingLeaders.insert(t)
+                }
+                targets.append(t)
+            }
+            guard !targets.isEmpty, targets.count == count || (count == 256 && dic == nil),
+                  targets.allSatisfy({ index[$0] != nil }) else { continue }
+            // The range check is the switch's default: fold it in when it is the only way to the dispatch.
+            var defaultTarget: UInt64?
+            if let g = guardInfo, blocks[b].preds == [g.pred], g.into || g.pred + 1 == b {
+                defaultTarget = g.defaultTarget
+                let last = blocks[g.pred].stmts.count - 1
+                if g.into { blocks[g.pred].stmts[last].kind = .jump(blocks[b].start) } else { blocks[g.pred].stmts.remove(at: last) }
+            }
+            blocks[b].stmts[blocks[b].stmts.count - 1].kind = .switchJump(table.index, targets, defaultTarget)
+            changed = true
+        }
+        if changed { link() }
+        return changed
+    }
+
+    /// With no block left that only a jump table could reach, a remaining `goto *x` is a tail call through a
+    /// function pointer (common in Swift): `return (*x)(…)` with the argument registers set up for it.
+    func convertIndirectTailCalls(_ paramCount: Int) -> Bool {
+        guard !blocks.indices.contains(where: { $0 != 0 && blocks[$0].preds.isEmpty }) else { return false }
+        var changed = false
+        for b in blocks.indices {
+            guard case .ijump(let e)? = blocks[b].stmts.last?.kind else { continue }
+            var defined = Set<Int>()
+            for st in blocks[b].stmts { for d in st.defs { if let i = abi.args.firstIndex(of: d) { defined.insert(i) } } }
+            let k = max(defined.max() ?? -1, paramCount - 1)
+            blocks[b].stmts[blocks[b].stmts.count - 1].kind = .ret(.call(e, (0..<(k + 1)).map { .v(abi.args[$0]) }))
+            changed = true
+        }
+        if changed { link() }
+        return changed
+    }
+
+    /// What each register holds at the end of block `b`, in terms of the block's inputs: assignments are
+    /// substituted forward, and a value is forgotten when something it reads changes (memory included).
+    func blockValues(_ b: Int) -> [String: Expr] {
+        var env: [String: Expr] = [:]
+        for s in blocks[b].stmts.dropLast() {
+            let value: Expr? = if case .set(_, let e) = s.kind { simplify(e.map { if case .v(let n) = $0, let v = env[n] { v } else { $0 } }) } else { nil }
+            let defs = Set(s.defs)
+            env = env.filter { r, e in !defs.contains(r) && defs.isDisjoint(with: e.vars) && !(s.writesMemory && e.readsMemory) }
+            if case .set(let r, _) = s.kind, let value, !value.hasCall { env[r] = value }
+        }
+        return env
+    }
+
+    func constValue(_ e: Expr) -> Int64? {
+        switch e {
+        case .c(let k): return k
+        case .global(let n): return a.names.first { $0.value == n }.map { Int64(bitPattern: $0.key) }
+        default: return nil
+        }
+    }
+
+    /// Matches `C + (load(T + I*size) << shift)` (arm64: byte/halfword offsets from an anchor; x86: int32 offsets from the table).
+    func matchJumpTable(_ e: Expr) -> (addr: UInt64, size: Int, index: Expr, base: Int64, shift: Int64)? {
+        func terms(_ e: Expr) -> [Expr] { if case .bin("+", let x, let y) = e { return terms(x) + terms(y) }; return [e] }
+        func split(_ e: Expr) -> (Int64, [Expr]) {
+            let t = terms(e)
+            return (t.compactMap(constValue).reduce(0, &+), t.filter { constValue($0) == nil })
+        }
+        let (base, rest) = split(e)
+        guard rest.count == 1 else { return nil }
+        var load = rest[0], shift: Int64 = 0
+        if case .bin("<<", let x, .c(let k)) = load { load = x; shift = k }
+        else if case .bin("*", let x, .c(let m)) = load, m > 0, m & (m - 1) == 0 { load = x; shift = Int64(m.trailingZeroBitCount) }
+        guard case .load(let addr, let size) = load, [1, 2, 4].contains(size) else { return nil }
+        let (tableAddr, idx) = split(addr)
+        guard idx.count == 1, tableAddr > 0 else { return nil }
+        var i = idx[0]
+        if size > 1 {
+            let lg = Int64(size.trailingZeroBitCount)
+            switch i {
+            case .bin("<<", let x, .c(lg)): i = x
+            case .bin("*", let x, .c(Int64(size))): i = x
+            default: return nil
+            }
+        }
+        return (UInt64(bitPattern: tableAddr), size, i, base, shift)
+    }
+
+    /// The range check guarding a jump table: `if (i > N) default` before it, or `if (i <= N)` into it.
+    func rangeGuard(_ b: Int, _ i: Expr) -> (count: Int, pred: Int, defaultTarget: UInt64?, into: Bool)? {
+        for p in blocks[b].preds {
+            guard case .branch(let c, let t)? = blocks[p].stmts.last?.kind, case .bin(var op, var x, var y) = c else { continue }
+            if case .c = x { swap(&x, &y); op = ["<": ">", ">": "<", "<=": ">=", ">=": "<="][op] ?? op }
+            guard x == i, case .c(let n) = y, n >= 0, n < 4096 else { continue }
+            let into = index[t] == b
+            let other = into ? (p + 1 < blocks.count ? blocks[p + 1].start : nil) : t
+            switch (op, into) {
+            case ("<=", true), (">", false): return (Int(n) + 1, p, other, into)
+            case ("<", true), (">=", false): return (Int(n), p, other, into)
+            default: continue
+            }
+        }
+        return nil
+    }
+
     /// Arguments are x0…xk (rdi…) where k is the highest argument register written since the previous call
     /// in the same block, raised to what the callee is known to take.
     func inferCallArguments() {
@@ -332,7 +499,11 @@ final class FunctionDecompiler {
                 }
                 if let target {
                     let known = objcArgCount(target, selector)
-                    let k = known.map { $0 - 1 } ?? max(defined.max() ?? -1, minArgs(target, selector) - 1)
+                    var k = known.map { $0 - 1 } ?? max(defined.max() ?? -1, minArgs(target, selector) - 1)
+                    if known == nil, let sig = signature(target) {
+                        // A fixed signature is exact; variadic and inferred ones are a floor.
+                        k = sig.variadic ? max(k, sig.count - 1) : sig.count - 1
+                    }
                     var args = (0..<min(k + 1, abi.args.count)).map { Expr.v(abi.args[$0]) }
                     var n: Int64 = 0
                     while let at = stackArgs[n * 8] {
@@ -396,6 +567,21 @@ final class FunctionDecompiler {
         return nil
     }
 
+    nonisolated(unsafe) static let parameterCache = NSCache<NSString, NSNumber>()
+
+    /// Argument count of a callee: a known C/runtime function, or what this decompiler infers for an internal one.
+    func signature(_ t: Expr) -> (count: Int, variadic: Bool)? {
+        guard case .global(let raw) = t else { return nil }
+        if let sig = Signatures.known[pretty(raw)] { return sig }
+        guard !light, let addr = calleeAddress[raw], let callee = a.function(containing: addr), callee.start == addr,
+              callee.start != f.start else { return nil }
+        let key = "\(a.macho.uuid?.uuidString ?? "-")|\(a.macho.arch)|\(a.instructions.count)|\(addr)" as NSString
+        if let n = Self.parameterCache.object(forKey: key) { return (n.intValue, true) }
+        let n = FunctionDecompiler(a, callee, light: true).prepare().paramCount
+        Self.parameterCache.setObject(NSNumber(value: n), forKey: key)
+        return (n, true)   // inferred counts can miss pass-through arguments, so treat them as a floor
+    }
+
     func minArgs(_ t: Expr, _ selector: String?) -> Int {
         guard case .global(let raw) = t else { return 0 }
         let n = pretty(raw)
@@ -425,7 +611,7 @@ final class FunctionDecompiler {
         var extra = [Set<String>](repeating: [], count: n), extraSuccs = [[Int]](repeating: [], count: n)
         for b in 0..<n where conservative {
             switch blocks[b].stmts.last?.kind {
-            case .ijump?: extraSuccs[b] = orphans
+            case .ijump?: extraSuccs[b] = orphans; extra[b] = Set(abi.args)   // a switch, or a tail call through a pointer
             case .jump(let t)?, .branch(_, let t)?: if index[t] == nil { extra[b] = Set(abi.args) }
             default: break
             }
@@ -556,7 +742,7 @@ final class FunctionDecompiler {
 
     // MARK: - Structuring
 
-    struct Region { var to: Int; var follow: Int?; var loopHead: Int?; var loopExit: Int? }
+    struct Region { var to: Int; var follow: Int?; var loopHead: Int?; var loopExit: Int?; var switchExit: Int? = nil }
 
     var lines: [String] = []
     var gotoTargets = Set<Int>()
@@ -601,7 +787,7 @@ final class FunctionDecompiler {
                 falls = true
                 if i == skipBranchOf { falls = false; i += 1; continue }
                 guard let ti = index[t] else { line("if (\(render(c))) goto 0x\(String(t, radix: 16));", ind); i += 1; continue }
-                if ti == r.loopExit { line("if (\(render(c))) break;", ind); i += 1 }
+                if ti == r.loopExit || ti == r.switchExit { line("if (\(render(c))) break;", ind); i += 1 }
                 else if ti == r.loopHead { line("if (\(render(c))) continue;", ind); i += 1 }
                 else if ti == i + 1 { i += 1 }
                 else if ti > i + 1, ti <= r.to {
@@ -639,6 +825,8 @@ final class FunctionDecompiler {
                     line("if (\(render(c))) goto \(label(ti));", ind)
                     i += 1
                 }
+            case .switchJump(let e, let targets, let d)?:
+                (i, falls) = emitSwitch(i, e, targets, d, r, ind)
             case .ret?, .ijump?, .halt?:
                 falls = false
                 i += 1
@@ -656,9 +844,67 @@ final class FunctionDecompiler {
         if ti == r.loopHead { if !(isLast && r.follow == ti) { line("continue;", ind) } }
         else if ti == r.loopExit { line("break;", ind) }
         else if isLast && ti == r.follow {}
+        else if ti == r.switchExit { line("break;", ind) }
         else if ti == i + 1 && !isLast {}
         else if isInlinableExit(ti) { emitInline(ti, ind) }
         else { gotoTargets.insert(ti); line("goto \(label(ti));", ind) }
+    }
+
+    /// Case bodies are laid out right after the dispatch in address order; each runs until the next case (C
+    /// fallthrough), and jumps to the shared exit become `break`. Any other layout gets `case k: goto …`.
+    func emitSwitch(_ i: Int, _ e: Expr, _ targets: [UInt64], _ defaultTarget: UInt64?, _ r: Region, _ ind: Int) -> (Int, Bool) {
+        let (subject, bias) = switchSubject(i, e)
+        var cases: [Int: [String]] = [:]
+        for (k, t) in targets.enumerated() { if let b = index[t] { cases[b, default: []].append("case \(constant(Int64(k) &+ bias)):") } }
+        if let d = defaultTarget, let b = index[d] { cases[b, default: []].append("default:") }
+        let order = cases.keys.sorted()
+        line("switch (\(render(subject))) {", ind)
+        if let first = order.first, let last = order.last, first == i + 1, last < r.to {
+            // `exit` may be the enclosing region's follow block; the last case then runs to the region's end.
+            let exit = switchEnd(i, order, r), end = min(exit, r.to)
+            for (j, b) in order.enumerated() {
+                line(cases[b]!.joined(separator: " "), ind)
+                var inner = r
+                inner.to = j + 1 < order.count ? order[j + 1] : end
+                inner.follow = j + 1 < order.count ? order[j + 1] : exit
+                inner.loopExit = nil; inner.switchExit = exit
+                emit(b, inner, ind + 1)
+            }
+            line("}", ind)
+            return (end, exit == end)   // leaving the switch reaches `exit`; past the region's end that's implicit
+        }
+        for b in order {
+            gotoTargets.insert(b)
+            line(cases[b]!.joined(separator: " ") + " goto \(label(b));", ind + 1)
+        }
+        line("}", ind)
+        return (i + 1, false)
+    }
+
+    /// `switch (x8)` where `x8 = x0 - 1` reads better as `switch (x0)` with the cases shifted, when x0 still
+    /// holds that value at the dispatch.
+    func switchSubject(_ i: Int, _ e: Expr) -> (Expr, Int64) {
+        if case .bin("-", let x, .c(let k)) = e { return (x, k) }
+        guard case .v(let r) = e else { return (e, 0) }
+        let scope = (blocks[i].preds.count == 1 ? blocks[blocks[i].preds[0]].stmts : []) + blocks[i].stmts
+        guard let at = scope.lastIndex(where: { $0.defs.contains(r) }),
+              case .set(_, .bin("-", .v(let a), .c(let k))) = scope[at].kind,
+              !scope[(at + 1)...].contains(where: { $0.defs.contains(a) }) else { return (e, 0) }
+        return (.v(a), k)
+    }
+
+    /// Where control goes after the switch: the block most cases jump to past the last case, else the first block
+    /// past it that is also reached from before the switch (the default), else the region's end.
+    func switchEnd(_ i: Int, _ order: [Int], _ r: Region) -> Int {
+        let last = order.last!
+        var votes: [Int: Int] = [:]
+        for b in order.first!..<r.to {
+            if case .jump(let t)? = blocks[b].stmts.last?.kind, let ti = index[t], ti > last, ti <= r.to || ti == r.follow {
+                votes[ti, default: 0] += 1
+            }
+        }
+        if let best = votes.max(by: { ($0.value, -$0.key) < ($1.value, -$1.key) }) { return best.key }
+        return (last + 1..<r.to).first { b in blocks[b].preds.contains { $0 < i } } ?? r.to
     }
 
     /// A short block that only one jump reaches and that leaves the function can be written at that jump.
@@ -705,7 +951,7 @@ final class FunctionDecompiler {
         case .ijump(let e): "goto *\(wrap(e, 2));"
         case .halt(let t): t + ";"
         case .asm(let t): "asm { \(t) }"
-        case .jump, .branch: nil
+        case .jump, .branch, .switchJump: nil
         }
     }
 

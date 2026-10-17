@@ -71,7 +71,20 @@ public struct Analysis: Sendable {
         stringAt = Dictionary(strings.map { ($0.address, $0.value) } + empty.map { ($0, "") }, uniquingKeysWith: { a, _ in a })
 
         let symbolAddress = Dictionary(macho.symbols.map { ($0.name, $0.address) }, uniquingKeysWith: { a, _ in a })
-        var ins = Self.parseOtool(try Self.otool(slice.data), symbolAddress)
+        // x86 instructions vary in length, so decoding a jump table in __text loses sync with the code after it.
+        // Disassemble a copy whose data-in-code bytes are 1-byte NOPs; the ranges are dropped below.
+        var text = slice.data
+        if macho.arch == "x86_64" {
+            for d in macho.dataInCode where d.fileOffset >= 0 && d.fileOffset + d.length <= text.count {
+                text.replaceSubrange(d.fileOffset..<d.fileOffset + d.length, with: repeatElement(0x90, count: d.length))
+            }
+        }
+        var ins = Self.parseOtool(try Self.otool(text), symbolAddress)
+        // otool decodes jump tables in __text as (junk) instructions; the file marks them as data.
+        if !macho.dataInCode.isEmpty {
+            let ranges = macho.dataInCode.map { $0.addr..<($0.addr + UInt64($0.length)) }
+            ins.removeAll { i in ranges.contains { $0.contains(i.address) } }
+        }
         var stubs: [UInt64: String] = [:]
         for i in ins where i.target != nil && i.comment.hasPrefix("symbol stub for: ") {
             stubs[i.target!] = String(i.comment.dropFirst("symbol stub for: ".count))

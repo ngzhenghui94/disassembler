@@ -78,7 +78,7 @@ func decompiles(arch: String, opt: String) throws {
 }
 
 /// Bugs found in the audit: each one used to drop or invent data flow.
-@Test(arguments: ["arm64", "x86_64"])
+@Test(arguments: ["arm64", "arm64e", "x86_64"])
 func decompilerRegressions(arch: String) throws {
     func build(_ src: String, _ opt: String) throws -> Analysis {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("decomp-reg-\(UUID().uuidString)")
@@ -103,8 +103,37 @@ func decompilerRegressions(arch: String) throws {
     #expect(getmsg.contains("return msg;"), "mutable global is read, not replaced by its initializer: \(getmsg)")
     #expect(!fcmp.contains("cmp_l") && !fcmp.contains("asm"), "float compare modelled: \(fcmp)")
 
+    // Jump tables become a switch (x86 tables live in __text and must not be decoded as code); case 8 falls into 9.
+    let sw2 = try build("""
+    extern int g1(int);
+    __attribute__((noinline)) int sw(int x, int y) { switch (x) { case 1: return g1(y); case 2: return g1(y + 1); case 3: return y * 2; case 4: return g1(y - 7); case 5: return y ^ 5; case 6: return g1(9); case 7: return g1(y*y); case 8: y += 4; case 9: return y | 1; case 10: return g1(3); case 11: return g1(y+11); default: return 0; } }
+    #include <string.h>
+    __attribute__((noinline)) long inner(long a, long b, long c) { return a * b - c; }
+    __attribute__((noinline)) long outer(long a, long b, long c) { return inner(a, b, c) + 1; }
+    __attribute__((noinline)) size_t len(const char *s) { return strlen(s) + 1; }
+    """, "-O2")
+    let switchCode = try code(sw2, "_sw")
+    #expect(switchCode.contains("switch (arg0) {") && switchCode.contains("case 8:") && switchCode.contains("case 9:")
+            && !switchCode.contains("goto *") && !switchCode.contains("asm"), "\(switchCode)")
+    // Arguments passed through untouched come from the callee's signature (internal or a known C function).
+    #expect(try code(sw2, "_outer").contains("inner(arg0, arg1, arg2)"))
+    #expect(try code(sw2, "_len").contains("strlen(arg0)"))
+
     if arch == "x86_64" {
         let oz = try build("extern int g1(int);\n__attribute__((noinline)) int five(void) { return g1(5) + 3; }", "-Oz")
         #expect(try code(oz, "_five").contains("g1(5)"), "push $5; pop %rdi")
     }
+}
+
+/// `ccmp` folds into the flag pair for one condition (and its complement); a reader asking anything else gets asm.
+@Test func conditionalCompareAnswersOneQuestion() throws {
+    let a = try Analysis(slice: fixture(arch: "arm64", strip: false))
+    let d = FunctionDecompiler(a, a.functions[0])
+    func ins(_ m: String, _ o: String) -> Instruction { Instruction(address: 0, bytes: "", mnemonic: m, operands: o, comment: "", target: nil) }
+    let ccmp = ins("ccmp", "x1, #0x2, #0x0, eq")
+    let folded = { (s: [Stmt]) in s.contains { if case .set("cmp_t", _) = $0.kind { true } else { false } } }
+    #expect(folded(d.liftARM(ccmp, following: [ins("b.ne", "0x10"), ins("cset", "w0, eq")][...])))
+    #expect(!folded(d.liftARM(ccmp, following: [ins("b.ne", "0x10"), ins("cset", "w0, lt")][...])))
+    #expect(folded(d.liftARM(ccmp, following: [ins("b.ne", "0x10"), ins("cmp", "x3, #0x1"), ins("cset", "w0, lt")][...])),
+            "a later compare ends the old flags")
 }
