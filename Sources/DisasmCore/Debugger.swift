@@ -5,17 +5,58 @@ public struct DebugFrame: Sendable, Decodable, Hashable {
     public let function: String
     public let pc: UInt64
     public let fileAddr: UInt64?   // unslid address, set only for frames in the analyzed binary
+    public let line: String?       // "File.swift:42" when the frame has debug info
+}
+
+public struct DebugVariable: Sendable, Decodable, Hashable, Identifiable {
+    public let id = UUID()
+    public let name: String
+    public let type: String
+    public let value: String
+    public let children: [DebugVariable]?   // one level deep, for structs, classes and pointers
+
+    enum CodingKeys: String, CodingKey { case name, type, value, children }
 }
 
 public struct DebugEvent: Sendable, Decodable {
-    public let event: String       // running | stopped | exited | output | error
+    public let event: String       // running | stopped | exited | output | error | memory
     public var reason: String?
     public var message: String?
     public var text: String?
     public var code: Int?
     public var pc: UInt64?
     public var frames: [DebugFrame]?
+    public var selectedFrame: Int?
     public var registers: [[String]]?
+    public var variables: [DebugVariable]?
+    public var breakpoint: String?   // our id of the breakpoint that was hit
+    public var addr: String?         // memory: hex address that was read
+    public var hex: String?          // memory: bytes as hex
+}
+
+/// What a breakpoint stops on. `id` is stable so the helper can find, toggle and delete it.
+public enum BreakpointSpec: Sendable, Hashable, Codable {
+    case address(UInt64)     // unslid address in the analyzed binary
+    case symbol(String)      // function name, in any loaded image
+    case exception(String)   // "objc", "swift" or "cpp"
+
+    public var id: String {
+        switch self {
+        case .address(let a): "a:\(a)"
+        case .symbol(let s): "s:\(s)"
+        case .exception(let l): "e:\(l)"
+        }
+    }
+
+    public func command(enabled: Bool) -> [String: Any] {
+        var c: [String: Any] = ["cmd": "bp_set", "id": id, "enabled": enabled]
+        switch self {
+        case .address(let a): c["kind"] = "address"; c["addr"] = a
+        case .symbol(let s): c["kind"] = "symbol"; c["name"] = s
+        case .exception(let l): c["kind"] = "exception"; c["lang"] = l
+        }
+        return c
+    }
 }
 
 /// Drives LLDB through its Python API (shipped with Xcode) in a helper process, speaking JSON lines.
@@ -75,7 +116,7 @@ public final class LLDBSession: @unchecked Sendable {
     }
 
     static let script = #"""
-import sys, os, json, threading
+import sys, os, json, shlex, threading
 sys.path.insert(0, sys.argv[1])
 import lldb
 
@@ -89,7 +130,8 @@ dbg = lldb.SBDebugger.Create()
 dbg.SetAsync(True)
 listener = dbg.GetListener()
 st = {"target": None, "process": None, "module": None, "uuid": None, "path": None}
-bps = {}
+bps = {}   # our id -> lldb breakpoint id
+LANGS = {"objc": lldb.eLanguageTypeObjC, "swift": lldb.eLanguageTypeSwift, "cpp": lldb.eLanguageTypeC_plus_plus}
 
 def file_addr(load):
     a = lldb.SBAddress(load, st["target"])
@@ -99,45 +141,95 @@ def file_addr(load):
     return None
 
 def find_module():
-    t = st["target"]
-    m = t.FindModule(lldb.SBFileSpec(st["path"]))
+    m = st["target"].FindModule(lldb.SBFileSpec(st["path"]))
     if m.IsValid():
         st["module"], st["uuid"] = m, m.GetUUIDString()
         return True
     return False
 
-def set_bp(addr):
-    if addr in bps:
+def set_bp(spec):
+    t, bid, kind = st["target"], spec["id"], spec["kind"]
+    if bid in bps:
+        t.BreakpointDelete(bps.pop(bid))
+    if kind == "address":
+        if st["module"] is None and not find_module():
+            emit(event="error", message="Binary isn't loaded in the debugged process; breakpoint at 0x%x not set" % spec["addr"])
+            return
+        bp = t.BreakpointCreateBySBAddress(st["module"].ResolveFileAddress(spec["addr"]))
+    elif kind == "symbol":
+        bp = t.BreakpointCreateByName(spec["name"])
+    else:
+        bp = t.BreakpointCreateForException(LANGS[spec["lang"]], False, True)
+    if not bp.IsValid():
+        emit(event="error", message="Couldn't create breakpoint " + bid)
         return
-    if st["module"] is None and not find_module():
-        emit(event="error", message="Binary isn't loaded in the debugged process, breakpoint at 0x%x not set" % addr)
-        return
-    bp = st["target"].BreakpointCreateBySBAddress(st["module"].ResolveFileAddress(addr))
-    bps[addr] = bp.GetID()
+    bp.SetEnabled(spec.get("enabled", True))
+    bps[bid] = bp.GetID()
 
-def snapshot():
+def var_json(v, depth=0):
+    value, summary = v.GetValue(), v.GetSummary()
+    d = {"name": v.GetName() or "?", "type": v.GetDisplayTypeName() or v.GetTypeName() or "",
+         "value": " ".join(s for s in (value, summary) if s) or ""}
+    n = v.GetNumChildren()
+    if depth == 0 and n:
+        d["children"] = [var_json(v.GetChildAtIndex(i), 1) for i in range(min(n, 50))]
+    return d
+
+def snapshot(selected=None):
     p = st["process"]
-    th = None
-    for t in p:
-        if t.GetStopReason() not in (lldb.eStopReasonNone, lldb.eStopReasonInvalid):
-            th = t
-            break
-    th = th or p.GetSelectedThread()
-    p.SetSelectedThread(th)
+    th = p.GetSelectedThread() if selected is not None else None
+    if th is None:
+        for t in p:
+            if t.GetStopReason() not in (lldb.eStopReasonNone, lldb.eStopReasonInvalid):
+                th = t
+                break
+        th = th or p.GetSelectedThread()
+        p.SetSelectedThread(th)
+        th.SetSelectedFrame(0)
     frames = []
     for i in range(min(th.GetNumFrames(), 100)):
         f = th.GetFrameAtIndex(i)
+        le = f.GetLineEntry()
         frames.append({"module": f.GetModule().GetFileSpec().GetFilename() or "?",
                        "function": f.GetDisplayFunctionName() or f.GetFunctionName() or "?",
-                       "pc": f.GetPC(), "fileAddr": file_addr(f.GetPC())})
+                       "pc": f.GetPC(), "fileAddr": file_addr(f.GetPC()),
+                       "line": "%s:%d" % (le.GetFileSpec().GetFilename(), le.GetLine()) if le.IsValid() and le.GetLine() else None})
+    index = th.GetSelectedFrame().GetFrameID()
+    f = th.GetFrameAtIndex(index)
     regs = []
-    f0 = th.GetFrameAtIndex(0)
-    sets = f0.GetRegisters()
+    sets = f.GetRegisters()
     if sets.GetSize() > 0:
         for r in sets.GetValueAtIndex(0):
             regs.append([r.GetName(), r.GetValue() or ""])
+    variables = [var_json(v) for v in f.GetVariables(True, True, False, True)]
+    hit = None
+    if th.GetStopReason() == lldb.eStopReasonBreakpoint:
+        lldb_id = th.GetStopReasonDataAtIndex(0)
+        hit = next((k for k, v in bps.items() if v == lldb_id), None)
     emit(event="stopped", reason="Thread %d: %s" % (th.GetIndexID(), th.GetStopDescription(256) or "stopped"),
-         pc=file_addr(f0.GetPC()), frames=frames, registers=regs)
+         pc=file_addr(th.GetFrameAtIndex(0).GetPC()), frames=frames, selectedFrame=index,
+         registers=regs, variables=variables, breakpoint=hit)
+
+def read_memory(p, expr, size):
+    f = p.GetSelectedThread().GetSelectedFrame()
+    try:
+        addr = int(expr, 0)
+    except ValueError:
+        reg = f.FindRegister(expr.lstrip("$"))
+        if reg.IsValid():
+            addr = reg.GetValueAsUnsigned()
+        else:
+            v = f.EvaluateExpression(expr)
+            if v.GetError().Fail():
+                emit(event="memory", message=v.GetError().GetCString() or "Can't evaluate " + expr)
+                return
+            addr = v.GetValueAsUnsigned()
+    err = lldb.SBError()
+    data = p.ReadMemory(addr, size, err)
+    if err.Fail():
+        emit(event="memory", addr="0x%x" % addr, message=err.GetCString())
+    else:
+        emit(event="memory", addr="0x%x" % addr, hex=data.hex())
 
 def drain():
     p = st["process"]
@@ -189,9 +281,10 @@ def handle(c):
         st["path"] = c["module"]
         t = new_target(c["path"], c.get("arch"))
         find_module()
-        for a in c.get("breakpoints", []):
-            set_bp(a)
-        info = lldb.SBLaunchInfo(c.get("args", []))
+        for spec in c.get("breakpoints", []):
+            set_bp(spec)
+        info = lldb.SBLaunchInfo(shlex.split(c.get("args", "")))
+        info.SetEnvironmentEntries(c.get("env", []), True)
         info.SetWorkingDirectory(os.path.dirname(c["path"]))
         err = lldb.SBError()
         st["process"] = t.Launch(info, err)
@@ -206,20 +299,37 @@ def handle(c):
             emit(event="exited", code=-1, message="Attach failed: " + err.GetCString())
             return
         find_module()
-        for a in c.get("breakpoints", []):
-            set_bp(a)
-    elif cmd == "break" and st["target"] is not None:
-        set_bp(c["addr"])
-    elif cmd == "unbreak" and c["addr"] in bps:
-        st["target"].BreakpointDelete(bps.pop(c["addr"]))
+        for spec in c.get("breakpoints", []):
+            set_bp(spec)
+    elif cmd == "bp_set" and st["target"] is not None:
+        set_bp(c)
+    elif cmd == "bp_remove" and c["id"] in bps:
+        st["target"].BreakpointDelete(bps.pop(c["id"]))
+    elif cmd == "bp_enable" and c["id"] in bps:
+        st["target"].FindBreakpointByID(bps[c["id"]]).SetEnabled(c["enabled"])
     elif p is None:
-        emit(event="error", message="No process")
+        if cmd not in ("bp_set", "bp_remove", "bp_enable"):
+            emit(event="error", message="No process")
     elif cmd == "continue":
         p.Continue()
     elif cmd == "pause":
         p.Stop()
     elif cmd in ("stepi", "nexti"):
         p.GetSelectedThread().StepInstruction(cmd == "nexti")
+    elif cmd in ("next", "step"):
+        th = p.GetSelectedThread()
+        if th.GetFrameAtIndex(0).GetLineEntry().IsValid():
+            th.StepOver() if cmd == "next" else th.StepInto()
+        else:
+            th.StepInstruction(cmd == "next")   # no line info here: step one instruction
+    elif cmd == "finish":
+        th = p.GetSelectedThread()
+        th.StepOutOfFrame(th.GetSelectedFrame())
+    elif cmd == "frame":
+        p.GetSelectedThread().SetSelectedFrame(c["index"])
+        snapshot(selected=c["index"])
+    elif cmd == "memory":
+        read_memory(p, c["expr"].strip(), c.get("size", 256))
     elif cmd == "kill":
         p.Kill()
 

@@ -35,12 +35,15 @@ struct DisassemblerApp: App {
                 Divider()
                 Button(doc.isRunning ? "Pause" : "Continue") { doc.send(doc.isRunning ? "pause" : "continue") }
                     .keyboardShortcut("y", modifiers: [.command, .control]).disabled(doc.session == nil)
-                Button("Step Over Instruction") { doc.send("nexti") }
-                    .keyboardShortcut(KeyEquivalent(Character(UnicodeScalar(0xF709)!)), modifiers: [])   // F6
-                    .disabled(doc.session == nil || doc.isRunning)
-                Button("Step Into Instruction") { doc.send("stepi") }
-                    .keyboardShortcut(KeyEquivalent(Character(UnicodeScalar(0xF70A)!)), modifiers: [])   // F7
-                    .disabled(doc.session == nil || doc.isRunning)
+                // Xcode's keys: F6/F7/F8 step by source line, with ⌃ by instruction.
+                Group {
+                    Button("Step Over") { doc.send("next") }.keyboardShortcut(fKey(6), modifiers: [])
+                    Button("Step Into") { doc.send("step") }.keyboardShortcut(fKey(7), modifiers: [])
+                    Button("Step Out") { doc.send("finish") }.keyboardShortcut(fKey(8), modifiers: [])
+                    Button("Step Over Instruction") { doc.send("nexti") }.keyboardShortcut(fKey(6), modifiers: .control)
+                    Button("Step Into Instruction") { doc.send("stepi") }.keyboardShortcut(fKey(7), modifiers: .control)
+                }
+                .disabled(doc.session == nil || doc.isRunning)
                 Button("Stop") { doc.stopDebugging(); doc.debugState = "Stopped" }
                     .keyboardShortcut(".").disabled(doc.session == nil)
             }
@@ -50,8 +53,11 @@ struct DisassemblerApp: App {
 
 func hex(_ v: UInt64) -> String { "0x" + String(v, radix: 16) }
 
+/// F1 is NSF1FunctionKey (0xF704); the rest follow in order.
+func fKey(_ n: Int) -> KeyEquivalent { KeyEquivalent(Character(UnicodeScalar(0xF703 + n)!)) }
+
 enum SidebarTab: String, CaseIterable {
-    case procedures = "Procs", imports = "Imports", strings = "Strings", crash = "Crash", info = "Info"
+    case procedures = "Procs", imports = "Imports", strings = "Strings", debug = "Debug", crash = "Crash", info = "Info"
 }
 
 struct ContentView: View {
@@ -79,7 +85,7 @@ struct ContentView: View {
                 }
             }
             .padding(.horizontal, 8)
-            .navigationSplitViewColumnWidth(min: 220, ideal: 300)
+            .navigationSplitViewColumnWidth(min: 280, ideal: 330)
         } detail: {
             if doc.debugState.isEmpty {
                 detail
@@ -229,6 +235,8 @@ struct Sidebar: View {
                     ForEach(a.strings.filter { matches($0.value) }) { s in
                         row(s.value, "\(a.xrefs[s.address]?.count ?? 0) refs") { doc.go(.xrefs(s.address, "\"\(s.value)\"")) }
                     }
+                case .debug:
+                    DebugSettingsSection()
                 case .crash:
                     CrashSection(analysis: a)
                 case .info:
@@ -405,6 +413,7 @@ struct InstructionRow: View {
                 Button { doc.toggleBreakpoint(ins.address) } label: {
                     Image(systemName: isPC ? "arrowtriangle.right.fill" : hasBreakpoint ? "circle.fill" : "circle")
                         .foregroundStyle(isPC ? AnyShapeStyle(.green) : hasBreakpoint ? AnyShapeStyle(.red) : AnyShapeStyle(.quaternary))
+                        .opacity(hasBreakpoint && !isPC && !doc.isEnabled(.address(ins.address)) ? 0.35 : 1)
                         .font(.caption)
                         .overlay(alignment: .bottomTrailing) {
                             if isPC && hasBreakpoint { Circle().fill(.red).frame(width: 5, height: 5) }
@@ -438,11 +447,77 @@ struct InstructionRow: View {
     }
 }
 
+struct DebugSettingsSection: View {
+    @Environment(Document.self) private var doc
+    @State private var newSymbol = ""
+
+    var body: some View {
+        @Bindable var doc = doc
+        Section("Breakpoints") {
+            if doc.allBreakpoints.isEmpty {
+                Text("Click the circle beside an instruction, or add a function name below.").font(.caption).foregroundStyle(.secondary)
+            }
+            ForEach(doc.allBreakpoints, id: \.self) { b in
+                HStack(spacing: 6) {
+                    Toggle("", isOn: Binding(get: { doc.isEnabled(b) }, set: { doc.setEnabled(b, $0) }))
+                        .labelsHidden().toggleStyle(.checkbox)
+                    Button {
+                        if case .address(let a) = b { doc.follow(a) }
+                    } label: {
+                        Label(doc.label(b), systemImage: { switch b {
+                        case .address: "number"
+                        case .symbol: "function"
+                        case .exception: "exclamationmark.octagon"
+                        } }())
+                        .lineLimit(1).truncationMode(.middle)
+                    }
+                    .buttonStyle(.plain)
+                    Spacer()
+                    Button { doc.remove(b) } label: { Image(systemName: "minus.circle") }
+                        .buttonStyle(.borderless).help("Remove breakpoint")
+                }
+                .foregroundStyle(doc.isEnabled(b) ? .primary : .secondary)
+            }
+            TextField("Break on function, e.g. malloc_error_break", text: $newSymbol)
+                .textFieldStyle(.roundedBorder)
+                .onSubmit {
+                    let name = newSymbol.trimmingCharacters(in: .whitespaces)
+                    if !name.isEmpty { doc.add(.symbol(name)); newSymbol = "" }
+                }
+        }
+        Section("Stop when thrown") {
+            ForEach(["objc", "swift", "cpp"], id: \.self) { lang in
+                Toggle(Document.exceptionLabels[lang] ?? lang, isOn: Binding(
+                    get: { doc.settings.exceptions.contains(lang) },
+                    set: { $0 ? doc.add(.exception(lang)) : doc.remove(.exception(lang)) }))
+            }
+        }
+        Section("Launch options") {
+            TextField("Arguments", text: $doc.settings.arguments).textFieldStyle(.roundedBorder)
+                .help("Passed to the app when you run it. Quote arguments that contain spaces.")
+            Text("Environment, one KEY=VALUE per line").font(.caption).foregroundStyle(.secondary)
+            TextEditor(text: $doc.settings.environment)
+                .font(.caption.monospaced())
+                .frame(height: 54)
+                .scrollContentBackground(.hidden)
+                .background(.background.opacity(0.4), in: RoundedRectangle(cornerRadius: 5))
+            ForEach(DebugSettings.presetVariables, id: \.name) { preset in
+                Toggle(preset.name, isOn: Binding(
+                    get: { doc.settings.presets.contains(preset.name) },
+                    set: { if $0 { doc.settings.presets.insert(preset.name) } else { doc.settings.presets.remove(preset.name) } }))
+                    .help("\(preset.help) (\(preset.env))")
+            }
+            Text("Saved for this app. Takes effect the next time you run it (⌘R).").font(.caption).foregroundStyle(.secondary)
+        }
+    }
+}
+
 struct DebugPanel: View {
     @Environment(Document.self) private var doc
 
     var body: some View {
         let live = doc.session != nil
+        let stopped = live && !doc.isRunning
         VStack(spacing: 0) {
             HStack(spacing: 12) {
                 Circle().fill(!live ? Color.gray : doc.isRunning ? .green : .orange).frame(width: 8, height: 8)
@@ -451,10 +526,12 @@ struct DebugPanel: View {
                 Button { doc.send(doc.isRunning ? "pause" : "continue") } label: {
                     Image(systemName: doc.isRunning ? "pause.fill" : "play.fill")
                 }.help(doc.isRunning ? "Pause (⌃⌘Y)" : "Continue (⌃⌘Y)").disabled(!live)
-                Button { doc.send("nexti") } label: { Image(systemName: "arrow.turn.down.right") }
-                    .help("Step over instruction (F6)").disabled(!live || doc.isRunning)
-                Button { doc.send("stepi") } label: { Image(systemName: "arrow.down.to.line") }
-                    .help("Step into instruction (F7)").disabled(!live || doc.isRunning)
+                Group {
+                    Button { doc.send("next") } label: { Image(systemName: "arrow.turn.down.right") }.help("Step over (F6, ⌃F6 by instruction)")
+                    Button { doc.send("step") } label: { Image(systemName: "arrow.down.to.line") }.help("Step into (F7, ⌃F7 by instruction)")
+                    Button { doc.send("finish") } label: { Image(systemName: "arrow.up.to.line") }.help("Step out (F8)")
+                }
+                .disabled(!stopped)
                 Button { doc.stopDebugging(); doc.debugState = "Stopped" } label: { Image(systemName: "stop.fill") }
                     .help("Stop (⌘.)").disabled(!live)
                 Button { doc.stopDebugging(); doc.debugState = ""; doc.console = "" } label: { Image(systemName: "xmark") }
@@ -465,33 +542,33 @@ struct DebugPanel: View {
             Divider()
             HSplitView {
                 List(Array(doc.stopFrames.enumerated()), id: \.offset) { i, f in
-                    let inBinary = f.fileAddr != nil
-                    Button {
-                        if let a = f.fileAddr { i == 0 ? doc.follow(a) : doc.goToReturnAddress(a) }
-                    } label: {
+                    Button { doc.selectFrame(i) } label: {
                         VStack(alignment: .leading, spacing: 1) {
                             Text("\(i)  \(f.function)").lineLimit(1).truncationMode(.middle)
-                            Text(f.module).font(.caption2).foregroundStyle(.secondary)
+                                .foregroundStyle(f.fileAddr != nil || f.line != nil ? .primary : .secondary)
+                            Text([f.module, f.line].compactMap { $0 }.joined(separator: " · ")).font(.caption2).foregroundStyle(.secondary)
                         }
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
-                    .foregroundStyle(inBinary ? Color.accentColor : .secondary)
-                    .disabled(!inBinary)
+                    .disabled(!stopped)
+                    .listRowBackground(i == doc.selectedFrame && stopped ? Color.accentColor.opacity(0.25) : nil)
                 }
                 .frame(minWidth: 200)
                 .opacity(doc.isRunning ? 0.4 : 1)
-                List(doc.registers, id: \.self) { r in
-                    let changed = doc.changedRegisters.contains(r.first ?? "")
-                    HStack {
-                        Text(r.first ?? "").foregroundStyle(.secondary).frame(width: 44, alignment: .leading)
-                        Text(r.count > 1 ? r[1] : "").textSelection(.enabled)
-                            .foregroundStyle(changed ? .orange : .primary)
-                            .fontWeight(changed ? .semibold : .regular)
+                VStack(spacing: 0) {
+                    @Bindable var doc = doc
+                    Picker("", selection: $doc.inspectorTab) {
+                        ForEach(InspectorTab.allCases, id: \.self) { Text($0.rawValue) }
                     }
-                    .help(changed ? "Changed since the last stop" : "")
+                    .pickerStyle(.segmented).labelsHidden().padding(6)
+                    switch doc.inspectorTab {
+                    case .variables: VariablesView()
+                    case .registers: RegistersView()
+                    case .memory: MemoryView()
+                    }
                 }
-                .frame(minWidth: 190)
+                .frame(minWidth: 280)
                 .opacity(doc.isRunning ? 0.4 : 1)   // values are from the last stop
                 ScrollView {
                     Text(doc.console.isEmpty ? "Program output appears here." : doc.console)
@@ -506,6 +583,83 @@ struct DebugPanel: View {
             .font(.caption.monospaced())
         }
     }
+}
+
+struct VariablesView: View {
+    @Environment(Document.self) private var doc
+
+    var body: some View {
+        if doc.variables.isEmpty {
+            Text(doc.session == nil ? "Variables appear when the app stops."
+                 : "No variables here. Frames without debug info (system code, stripped builds) have none.")
+                .foregroundStyle(.secondary).padding().frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        } else {
+            List(doc.variables, children: \.children) { v in
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(v.name)
+                    Text(v.value).foregroundStyle(.orange).textSelection(.enabled).lineLimit(1).truncationMode(.tail)
+                    Spacer(minLength: 4)
+                    Text(v.type).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                }
+                .contextMenu {
+                    if doc.variables.contains(v) {   // only top-level names are valid lldb expressions
+                        Button("View Memory of \(v.name)") { doc.readMemory("&" + v.name) }
+                        if v.type.hasSuffix("*") { Button("View Memory at \(v.name)") { doc.readMemory(v.name) } }
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct RegistersView: View {
+    @Environment(Document.self) private var doc
+
+    var body: some View {
+        List(doc.registers, id: \.self) { r in
+            let changed = doc.changedRegisters.contains(r.first ?? "")
+            HStack {
+                Text(r.first ?? "").foregroundStyle(.secondary).frame(width: 44, alignment: .leading)
+                Text(r.count > 1 ? r[1] : "").textSelection(.enabled)
+                    .foregroundStyle(changed ? .orange : .primary)
+                    .fontWeight(changed ? .semibold : .regular)
+            }
+            .help(changed ? "Changed since the last stop" : "")
+            .contextMenu { Button("View Memory at \(r.first ?? "")") { doc.readMemory(r.first ?? "") } }
+        }
+    }
+}
+
+struct MemoryView: View {
+    @Environment(Document.self) private var doc
+    @State private var text = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                TextField("Address, register or expression (sp, &count, $x0 + 16)", text: $text)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit { doc.readMemory(text) }
+                    .onAppear { text = doc.memoryExpression }
+                    .onChange(of: doc.memoryExpression) { text = doc.memoryExpression }
+                Button("Read") { doc.readMemory(text) }.disabled(text.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+            .padding(.horizontal, 6)
+            if let message = doc.memoryMessage {
+                Text(message).foregroundStyle(.red).padding(.horizontal, 6)
+            }
+            if let m = doc.memory {
+                ScrollView([.vertical, .horizontal]) {
+                    Text(HexDump.format(m.address, m.bytes)).textSelection(.enabled).padding(6)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            } else if doc.memoryMessage == nil {
+                Text("Right-click a register or variable, or type an address.").foregroundStyle(.secondary).padding(.horizontal, 6)
+                Spacer()
+            }
+        }
+    }
+
 }
 
 struct XrefsView: View {

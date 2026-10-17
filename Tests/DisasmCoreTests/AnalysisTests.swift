@@ -3,17 +3,23 @@ import Testing
 @testable import DisasmCore
 
 /// Compiles a tiny C program and checks the whole pipeline: parsing, functions, calls, string xrefs.
-func fixtureBinary(arch: String, strip: Bool) throws -> URL {
+func fixtureBinary(arch: String, strip: Bool, optimize: Bool = true) throws -> URL {
     let dir = FileManager.default.temporaryDirectory.appendingPathComponent("disasm-test-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     let src = dir.appendingPathComponent("t.c"), bin = dir.appendingPathComponent("t")
     try """
     #include <stdio.h>
-    __attribute__((noinline)) int helper(int x) { return x * 3; }
+    #include <stdlib.h>
+    __attribute__((noinline)) int helper(int x) {
+      int doubled = x * 2;
+      const char *mode = getenv("FIXTURE_MODE");
+      printf("mode=%s doubled=%d\\n", mode ? mode : "none", doubled);
+      return doubled + 1;
+    }
     int main(int argc, char **argv) { puts("hello-from-fixture"); return helper(argc); }
     """.write(to: src, atomically: true, encoding: .utf8)
     // Separate compile and link: debug info stays in t.o behind the binary's debug map, like an Xcode Debug build.
-    _ = try Analysis.run("/usr/bin/xcrun", ["clang", "-g", "-O1", "-arch", arch, "-c", src.path, "-o", dir.appendingPathComponent("t.o").path])
+    _ = try Analysis.run("/usr/bin/xcrun", ["clang", "-g", optimize ? "-O1" : "-O0", "-arch", arch, "-c", src.path, "-o", dir.appendingPathComponent("t.o").path])
     _ = try Analysis.run("/usr/bin/xcrun", ["clang", "-arch", arch, dir.appendingPathComponent("t.o").path, "-o", bin.path])
     if strip { _ = try Analysis.run("/usr/bin/xcrun", ["strip", bin.path]) }
     return bin

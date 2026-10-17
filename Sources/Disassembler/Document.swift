@@ -8,6 +8,30 @@ enum Destination: Hashable {
     case xrefs(UInt64, String)     // everything that references an address (string, import, data)
 }
 
+/// Per-app launch options and the breakpoints that survive rebuilds (address breakpoints don't).
+struct DebugSettings: Codable, Equatable {
+    var arguments = ""
+    var environment = ""             // KEY=VALUE per line
+    var presets: Set<String> = []
+    var symbols: [String] = []
+    var exceptions: Set<String> = []
+    var disabled: Set<String> = []   // BreakpointSpec ids
+
+    static let presetVariables: [(name: String, env: String, help: String)] = [
+        ("Zombie Objects", "NSZombieEnabled=YES", "Freed Obj-C objects stay alive as zombies that log any message sent to them"),
+        ("Malloc Scribble", "MallocScribble=1", "Fill new allocations with 0xAA and freed memory with 0x55"),
+        ("Malloc Guard Edges", "MallocGuardEdges=1", "Put guard pages before and after large allocations"),
+        ("Malloc Stack Logging", "MallocStackLogging=1", "Record allocation backtraces for leaks and malloc_history"),
+    ]
+
+    var environmentEntries: [String] {
+        Self.presetVariables.filter { presets.contains($0.name) }.map(\.env)
+            + environment.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { $0.contains("=") }
+    }
+}
+
+enum InspectorTab: String, CaseIterable { case variables = "Variables", registers = "Registers", memory = "Memory" }
+
 struct SourceHeader: Hashable {
     let location: String   // "File.swift:42"
     let text: String       // that line of source, if the file is on disk
@@ -39,7 +63,14 @@ final class Document {
 
     var session: LLDBSession?
     private var sessionToken = UUID()
-    var breakpoints: Set<UInt64> = []
+    var breakpoints: Set<UInt64> = []   // address breakpoints in the open binary
+    var settings = DebugSettings() { didSet { saveSettings() } }
+    var variables: [DebugVariable] = []
+    var selectedFrame = 0
+    var inspectorTab = InspectorTab.variables
+    var memoryExpression = ""
+    var memory: (address: UInt64, bytes: [UInt8])?
+    var memoryMessage: String?
     var debugState = ""
     var isRunning = false
     var pc: UInt64?
@@ -75,6 +106,7 @@ final class Document {
         stopDebugging()
         url = exe; error = nil; analysis = nil; destination = nil; history = []; slices = []
         breakpoints = []
+        settings = Self.loadSettings(for: launchURL)
         do {
             slices = try MachO.slices(of: Data(contentsOf: exe, options: .mappedIfSafe))
         } catch {
@@ -229,7 +261,23 @@ final class Document {
             .first { $0.executableURL?.resolvingSymlinksInPath() == exe }?.processIdentifier
     }
 
-    func launch() { startSession(["cmd": "launch", "path": launchURL?.path ?? ""]) }
+    /// Keyed by the resolved path so /tmp vs /private/tmp (or any symlinked folder) share one entry.
+    private static func settingsKey(_ exe: URL) -> String { "debug:" + exe.resolvingSymlinksInPath().path }
+
+    private static func loadSettings(for exe: URL?) -> DebugSettings {
+        guard let exe, let data = UserDefaults.standard.data(forKey: settingsKey(exe)),
+              let s = try? JSONDecoder().decode(DebugSettings.self, from: data) else { return DebugSettings() }
+        return s
+    }
+
+    private func saveSettings() {
+        guard let exe = launchURL, let data = try? JSONEncoder().encode(settings) else { return }
+        UserDefaults.standard.set(data, forKey: Self.settingsKey(exe))
+    }
+
+    func launch() {
+        startSession(["cmd": "launch", "path": launchURL?.path ?? "", "args": settings.arguments, "env": settings.environmentEntries])
+    }
 
     func attach() {
         guard let pid = runningPID else {
@@ -250,7 +298,7 @@ final class Document {
             session = s
             var cmd = command
             cmd["module"] = module
-            cmd["breakpoints"] = Array(breakpoints)
+            cmd["breakpoints"] = allBreakpoints.map { $0.command(enabled: isEnabled($0)) }
             if !arch.contains(" ") { cmd["arch"] = arch }
             s.send(cmd)
         } catch {
@@ -262,18 +310,74 @@ final class Document {
         session?.terminate()
         session = nil
         isRunning = false; pc = nil; stopFrames = []; registers = []; changedRegisters = []
+        variables = []; selectedFrame = 0; memory = nil; memoryMessage = nil
     }
 
     func send(_ cmd: String) { session?.send(["cmd": cmd]) }
 
+    func selectFrame(_ index: Int) { session?.send(["cmd": "frame", "index": index]) }
+
+    /// Accepts an address, a register name, or any expression lldb can evaluate (`&count`, `$x0 + 8`).
+    func readMemory(_ expression: String) {
+        let expr = expression.trimmingCharacters(in: .whitespaces)
+        guard !expr.isEmpty else { return }
+        memoryExpression = expr
+        inspectorTab = .memory
+        guard session != nil, !isRunning else {
+            memoryMessage = "Memory can be read while the app is stopped."
+            return
+        }
+        session?.send(["cmd": "memory", "expr": expr, "size": 256])
+    }
+
+    // MARK: - Breakpoints
+
+    var allBreakpoints: [BreakpointSpec] {
+        settings.exceptions.sorted().map { .exception($0) } + settings.symbols.map { .symbol($0) } + breakpoints.sorted().map { .address($0) }
+    }
+
+    func isEnabled(_ b: BreakpointSpec) -> Bool { !settings.disabled.contains(b.id) }
+
+    func setEnabled(_ b: BreakpointSpec, _ on: Bool) {
+        if on { settings.disabled.remove(b.id) } else { settings.disabled.insert(b.id) }
+        session?.send(["cmd": "bp_enable", "id": b.id, "enabled": on])
+    }
+
+    func add(_ b: BreakpointSpec) {
+        switch b {
+        case .address(let a): breakpoints.insert(a)
+        case .symbol(let name): if !settings.symbols.contains(name) { settings.symbols.append(name) }
+        case .exception(let lang): settings.exceptions.insert(lang)
+        }
+        settings.disabled.remove(b.id)
+        session?.send(b.command(enabled: true))
+    }
+
+    func remove(_ b: BreakpointSpec) {
+        switch b {
+        case .address(let a): breakpoints.remove(a)
+        case .symbol(let name): settings.symbols.removeAll { $0 == name }
+        case .exception(let lang): settings.exceptions.remove(lang)
+        }
+        settings.disabled.remove(b.id)
+        session?.send(["cmd": "bp_remove", "id": b.id])
+    }
+
     func toggleBreakpoint(_ addr: UInt64) {
-        if breakpoints.remove(addr) != nil {
-            session?.send(["cmd": "unbreak", "addr": addr])
-        } else {
-            breakpoints.insert(addr)
-            session?.send(["cmd": "break", "addr": addr])
+        breakpoints.contains(addr) ? remove(.address(addr)) : add(.address(addr))
+    }
+
+    static let exceptionLabels = ["objc": "Objective-C exceptions", "swift": "Swift errors", "cpp": "C++ exceptions"]
+
+    func label(_ b: BreakpointSpec) -> String {
+        switch b {
+        case .address(let a): analysis?.name(of: a) ?? hex(a)
+        case .symbol(let name): name
+        case .exception(let lang): "Thrown " + (Self.exceptionLabels[lang] ?? lang)
         }
     }
+
+    // MARK: - Events
 
     private func handle(_ e: DebugEvent, _ token: UUID) {
         guard session != nil, token == sessionToken else { return }   // ignore events from an earlier session
@@ -283,21 +387,29 @@ final class Document {
         case "stopped":
             isRunning = false
             debugState = e.reason ?? "Stopped"
+            // Name the breakpoint instead of lldb's internal "breakpoint 2.1".
+            if let id = e.breakpoint, let b = allBreakpoints.first(where: { $0.id == id }) {
+                let thread = debugState.components(separatedBy: ":").first ?? "Stopped"
+                if case .exception = b { debugState = thread + ": " + label(b) } else { debugState = thread + ": breakpoint at " + label(b) }
+            }
             stopFrames = e.frames ?? []
+            variables = e.variables ?? []
+            let frame = e.selectedFrame ?? 0
             let old = Dictionary(registers.compactMap { $0.count == 2 ? ($0[0], $0[1]) : nil }, uniquingKeysWith: { a, _ in a })
             registers = e.registers ?? []
-            changedRegisters = old.isEmpty ? [] : Set(registers.compactMap { $0.count == 2 && old[$0[0]] != $0[1] ? $0[0] : nil })
+            // Only diff consecutive stops of the same frame; switching frames isn't a change.
+            changedRegisters = old.isEmpty || frame != selectedFrame ? []
+                : Set(registers.compactMap { $0.count == 2 && old[$0[0]] != $0[1] ? $0[0] : nil })
+            selectedFrame = frame
             pc = e.pc
-            // Show where we stopped, or the nearest caller inside this binary.
-            if let first = stopFrames.firstIndex(where: { $0.fileAddr != nil }), let addr = stopFrames[first].fileAddr {
-                if first > 0 {
-                    goToReturnAddress(addr)
-                } else if case .code(let cur) = destination, let a = analysis,
-                          a.function(containing: cur)?.start == a.function(containing: addr)?.start {
-                    destination = .code(addr)   // stepping within a function shouldn't flood Back history
-                } else {
-                    go(.code(addr))
-                }
+            showStop(frame)
+            if inspectorTab == .memory, !memoryExpression.isEmpty { readMemory(memoryExpression) }   // keep the dump live
+        case "memory":
+            memoryMessage = e.message
+            if let addr = e.addr.flatMap({ UInt64($0.dropFirst(2), radix: 16) }), let bytes = e.hex.flatMap(HexDump.bytes(fromHex:)) {
+                memory = (addr, bytes)
+            } else {
+                memory = nil
             }
         case "exited":
             debugState = "Exited" + (e.code.map { " (status \($0))" } ?? "") + (e.message.map { $0.isEmpty ? "" : ": \($0)" } ?? "")
@@ -309,6 +421,23 @@ final class Document {
             console += "error: \(e.message ?? "")\n"
         default:
             break
+        }
+    }
+
+    /// Shows the selected frame, or for a fresh stop the nearest frame inside this binary.
+    private func showStop(_ frame: Int) {
+        if frame > 0 {
+            if stopFrames.indices.contains(frame), let addr = stopFrames[frame].fileAddr { goToReturnAddress(addr) }
+            return
+        }
+        guard let first = stopFrames.firstIndex(where: { $0.fileAddr != nil }), let addr = stopFrames[first].fileAddr else { return }
+        if first > 0 {
+            goToReturnAddress(addr)
+        } else if case .code(let cur) = destination, let a = analysis,
+                  a.function(containing: cur)?.start == a.function(containing: addr)?.start {
+            destination = .code(addr)   // stepping within a function shouldn't flood Back history
+        } else {
+            go(.code(addr))
         }
     }
 }
