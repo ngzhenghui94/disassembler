@@ -76,3 +76,35 @@ func decompiles(arch: String, opt: String) throws {
     #expect(desc.contains("[super description]") && desc.contains("stringByAppendingString:@\"!\""), "\(desc)")
     #expect(both.contains("&&") && !both.contains("asm"), "\(both)")
 }
+
+/// Bugs found in the audit: each one used to drop or invent data flow.
+@Test(arguments: ["arm64", "x86_64"])
+func decompilerRegressions(arch: String) throws {
+    func build(_ src: String, _ opt: String) throws -> Analysis {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("decomp-reg-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let c = dir.appendingPathComponent("r.c"), bin = dir.appendingPathComponent("r.dylib")
+        try src.write(to: c, atomically: true, encoding: .utf8)
+        _ = try Analysis.run("/usr/bin/xcrun", ["clang", opt, "-arch", arch, "-dynamiclib", "-undefined", "dynamic_lookup", c.path, "-o", bin.path])
+        return try Analysis(slice: MachO.slices(of: Data(contentsOf: bin))[0])
+    }
+    let a = try build("""
+    extern int g1(int);
+    const char *msg = "initial";
+    __attribute__((noinline)) double fret(double a, double b) { return a * b + 1.0; }
+    __attribute__((noinline)) int sw(int x, int y) { int k = y * 3; switch (x) { case 0: return k; case 1: return k + 1; case 2: return k * 2; case 3: return k - 7; case 4: return k ^ 5; case 5: return k | 9; default: return 0; } }
+    __attribute__((noinline)) const char *getmsg(void) { return msg; }
+    __attribute__((noinline)) int fcmp(double a, double b) { return a < b ? g1(1) : g1(2); }
+    """, "-O1")
+    let fret = try code(a, "_fret"), sw = try code(a, "_sw"), getmsg = try code(a, "_getmsg"), fcmp = try code(a, "_fcmp")
+    #expect(fret.contains("return") && fret.contains("*") && !fret.hasPrefix("void"), "float result kept: \(fret)")
+    // x86 dispatches through a jump table: `rax = y * 3` must survive the computed jump.
+    #expect(arch == "x86_64" ? sw.contains("rax = rsi + rsi * 2") : sw.contains("arg1 + (arg1 << 1)"), "value used by switch cases kept: \(sw)")
+    #expect(getmsg.contains("return msg;"), "mutable global is read, not replaced by its initializer: \(getmsg)")
+    #expect(!fcmp.contains("cmp_l") && !fcmp.contains("asm"), "float compare modelled: \(fcmp)")
+
+    if arch == "x86_64" {
+        let oz = try build("extern int g1(int);\n__attribute__((noinline)) int five(void) { return g1(5) + 3; }", "-Oz")
+        #expect(try code(oz, "_five").contains("g1(5)"), "push $5; pop %rdi")
+    }
+}

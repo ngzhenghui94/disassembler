@@ -54,6 +54,7 @@ extension FunctionDecompiler {
     func slotValue(_ ins: Instruction, _ size: Int) -> Expr? {
         guard let slot = ins.dataRefs.first else { return nil }
         if let v = slotTarget(slot) { return v }
+        guard isConstantSlot(slot) else { return .load(addrExpr(slot), size) }   // a mutable global: read it
         let c = ins.comment
         for p in ["literal pool symbol address: ", "Objc class ref: "] {
             if let r = c.range(of: p) { return symbolValue(String(c[r.upperBound...]).trimmingCharacters(in: .whitespaces)) }
@@ -65,10 +66,20 @@ extension FunctionDecompiler {
 
     /// What a pointer slot holds, when the file says: an imported symbol, a selector, a class or a local symbol/string.
     func slotTarget(_ slot: UInt64) -> Expr? {
+        guard isConstantSlot(slot) else { return nil }
         if let b = a.binds[slot] { return symbolValue(b) }
         guard let t = Analysis.derefTarget(a.macho, slot, a.stringAt, a.names) else { return nil }
         if a.macho.section(containing: slot)?.name.contains("selref") == true, let s = a.stringAt[t] { return .raw("@selector(\(s))") }
         return addrExpr(t)
+    }
+
+    /// GOT, selector/class refs and other read-only-after-load pointers. A `__data` pointer is a variable whose
+    /// initial value is in the file but whose current value isn't.
+    func isConstantSlot(_ addr: UInt64) -> Bool {
+        guard let s = a.macho.section(containing: addr) else { return false }
+        return s.segment == "__DATA_CONST" || s.segment == "__AUTH_CONST" || s.name == "__const"
+            || ["__got", "__auth_got", "__auth_ptr", "__la_symbol_ptr", "__nl_symbol_ptr"].contains(s.name)
+            || (s.name.hasPrefix("__objc_") && s.name.hasSuffix("refs"))
     }
 
     func symbolValue(_ n: String) -> Expr {
@@ -118,7 +129,7 @@ extension FunctionDecompiler {
     static let armStores: Set<String> = ["str", "stur", "strb", "sturb", "strh", "sturh", "stlr", "stlrb", "stlrh", "stp", "stnp"]
     static let armBinary: [String: String] = [
         "add": "+", "adds": "+", "sub": "-", "subs": "-", "and": "&", "ands": "&", "orr": "|", "eor": "^", "mul": "*",
-        "sdiv": "/", "udiv": "/", "lsl": "<<", "lsr": ">>", "asr": ">>", "lslv": "<<", "lsrv": ">>", "asrv": ">>",
+        "sdiv": "/", "udiv": "/", "lsl": "<<", "lsr": ">>", "asr": "s>>", "lslv": "<<", "lsrv": ">>", "asrv": "s>>",
         "fadd": "+", "fsub": "-", "fmul": "*", "fdiv": "/", "smull": "*", "umull": "*",
     ]
 
@@ -151,7 +162,8 @@ extension FunctionDecompiler {
         let amt = p.count > 1 ? Self.immediate(String(p[1])) ?? 0 : 0
         switch p[0] {
         case "lsl": return .bin("<<", e, .c(amt))
-        case "lsr", "asr", "ror": return .bin(">>", e, .c(amt))
+        case "lsr", "ror": return .bin(">>", e, .c(amt))
+        case "asr": return .bin("s>>", e, .c(amt))
         case "uxtb": return .bin("<<", .bin("&", e, .c(0xff)), .c(amt))
         case "uxth": return .bin("<<", .bin("&", e, .c(0xffff)), .c(amt))
         default: return .bin("<<", e, .c(amt))
@@ -215,11 +227,72 @@ extension FunctionDecompiler {
         return [Stmt(kind: .set("cmp_t", result))] + pair.map { Stmt(kind: .set($0.0, $0.1)) }
     }
 
+    static func calleeSaved(_ r: String) -> Bool {
+        if r.hasPrefix("x"), let n = Int(r.dropFirst()) { return n >= 19 }
+        if r.hasPrefix("v"), let n = Int(r.dropFirst()) { return (8...15).contains(n) }
+        return false
+    }
+
+    /// Registers and base of an arm64 load/store, if every register is callee-saved and the base is sp/x29.
+    func frameAccess(_ ins: Instruction) -> (regs: [String], load: Bool)? {
+        let m = ins.mnemonic
+        guard Self.armLoads.contains(m) || Self.armStores.contains(m) else { return nil }
+        let ops = Self.splitOperands(ins.operands)
+        let n = m.hasSuffix("p") ? 2 : 1
+        guard ops.count > n, ops[n].hasPrefix("["),
+              let base = Self.splitOperands(String(ops[n].dropFirst().prefix { $0 != "]" })).first.flatMap(armReg),
+              base == "sp" || base == abi.fp else { return nil }
+        let regs = ops.prefix(n).compactMap(armReg)
+        guard regs.count == n, regs.allSatisfy(Self.calleeSaved) else { return nil }
+        return (regs, Self.armLoads.contains(m))
+    }
+
+    /// Instructions that save callee-saved registers on entry (before anything writes them or calls out) and
+    /// restore them on the way out (followed only by frame teardown and a return or tail jump). A spill of x19–x28
+    /// in the body is real data flow and stays.
+    func computeFrameSaves(_ insns: [Instruction]) -> Set<UInt64> {
+        var result = Set<UInt64>(), written = Set<String>(), called = false
+        for (k, ins) in insns.enumerated() {
+            if let acc = frameAccess(ins) {
+                // fp/lr saves are frame linkage wherever they are (shrink-wrapped and Swift async frames included).
+                if acc.regs.allSatisfy({ $0 == "x29" || $0 == "x30" }) { result.insert(ins.address) }
+                if !acc.load, !called, written.isDisjoint(with: acc.regs) { result.insert(ins.address) }
+                if acc.load, isEpilogue(insns, from: k + 1) { result.insert(ins.address) }
+            }
+            if ins.mnemonic.hasPrefix("bl") { called = true }
+            let ops = Self.splitOperands(ins.operands)
+            if !Self.armStores.contains(ins.mnemonic), let d = ops.first.flatMap(armReg) { written.insert(d) }
+        }
+        return result
+    }
+
+    func isEpilogue(_ insns: [Instruction], from k: Int) -> Bool {
+        for ins in insns[k..<min(k + 24, insns.count)] {
+            let m = ins.mnemonic
+            if ["ret", "retaa", "retab", "b", "br", "braa", "brab", "braaz", "brabz"].contains(m) { return true }
+            if frameAccess(ins)?.load == true { continue }
+            if Self.armLoads.contains(m) || Self.armStores.contains(m) || m.hasPrefix("bl") || m.hasPrefix("b.") || m.hasPrefix("cb") { return false }
+            if m.hasPrefix("tb"), !(ins.operands.hasPrefix("x16") || ins.operands.hasPrefix("x17")) { return false }   // PAC check uses x16
+        }
+        return false
+    }
+
+    /// An instruction with a branch target whose meaning isn't modelled still has that edge in the CFG.
+    func keepEdge(_ ins: Instruction, _ stmts: [Stmt]) -> [Stmt] {
+        guard let t = ins.target, inside(t), stmts.last.map({ if case .asm = $0.kind { true } else { false } }) == true,
+              !ins.mnemonic.hasPrefix("bl"), !ins.mnemonic.hasPrefix("call") else { return stmts }
+        return stmts + [Stmt(kind: .branch(.raw("__asm_condition(\"\(ins.mnemonic)\")"), t))]
+    }
+
     func liftARM(_ ins: Instruction, next: Instruction?) -> [Stmt] {
         let m = ins.mnemonic
         let ops = Self.splitOperands(ins.operands)
         let regsUsed = ops.flatMap { $0.split(whereSeparator: { " [],!".contains($0) }) }.compactMap { armReg(String($0)) }.filter { $0 != "zr" }
-        let fallback = { self.asm(ins, defs: ops.first.flatMap { self.armReg($0) }.map { [$0] } ?? [], uses: regsUsed) }
+        let carry = ["adc", "adcs", "sbc", "sbcs", "ngc", "ngcs"].contains(m)   // read the carry flag; the -s forms set flags
+        let fallback = {
+            self.keepEdge(ins, self.asm(ins, defs: (ops.first.flatMap { self.armReg($0) }.map { [$0] } ?? []) + (carry && m.hasSuffix("s") ? ABI.flags : []),
+                                        uses: regsUsed + (carry ? ABI.flags : [])))
+        }
         if m.hasPrefix("pac") || m.hasPrefix("aut") || m.hasPrefix("xpac") || ["nop", "hint", "bti", "prfm", "prfum", "yield", "clrex", "dmb", "dsb", "isb"].contains(m) {
             return []
         }
@@ -254,8 +327,8 @@ extension FunctionDecompiler {
         case "tbz", "tbnz":
             guard let x = op(0), ops.count > 1, let bit = Self.immediate(ops[1]), let t = ins.target else { return fallback() }
             return [Stmt(kind: .branch(.bin(m == "tbz" ? "==" : "!=", .bin("&", x, .c(1 << bit)), .c(0)), t))]
-        case _ where m.hasPrefix("b."):
-            guard let c = condition(String(m.dropFirst(2))), let t = ins.target else { return fallback() }
+        case _ where m.hasPrefix("b.") || m.hasPrefix("bc."):
+            guard let c = condition(String(m.split(separator: ".", maxSplits: 1).last ?? "")), let t = ins.target else { return fallback() }
             return [Stmt(kind: .branch(c, t))]
         case "brk", "udf", "hlt":
             return [Stmt(kind: .halt("__builtin_trap()"))]
@@ -334,7 +407,7 @@ extension FunctionDecompiler {
             guard let d, let x = op(1), ops.count == 4, let lsb = Self.immediate(ops[2]), let w = Self.immediate(ops[3]), w < 64 else { return fallback() }
             let mask = Expr.c((1 << w) &- 1)
             switch m {
-            case "ubfx", "sbfx": return set(.bin("&", .bin(">>", x, .c(lsb)), mask))
+            case "ubfx", "sbfx": return set(.bin("&", .bin(m == "sbfx" ? "s>>" : ">>", x, .c(lsb)), mask))
             case "ubfiz", "sbfiz": return set(.bin("<<", .bin("&", x, mask), .c(lsb)))
             case "bfi": return set(.bin("|", .bin("&", .v(d), .c(~(((1 << w) &- 1) << lsb))), .bin("<<", .bin("&", x, mask), .c(lsb))))
             default: return set(.bin("|", .bin("&", .v(d), .c(~((1 << w) &- 1))), .bin("&", .bin(">>", x, .c(lsb)), mask)))
@@ -403,14 +476,12 @@ extension FunctionDecompiler {
         let inner = memTok.drop { $0 == "[" }.prefix { $0 != "]" }
         let parts = Self.splitOperands(String(inner))
         guard let base = parts.first.flatMap(armReg) else { return nil }
-        let calleeSaved = { (r: String) in
-            if r.hasPrefix("x"), let n = Int(r.dropFirst()) { return n >= 19 }
-            if r.hasPrefix("v"), let n = Int(r.dropFirst()) { return (8...15).contains(n) }
-            return false
-        }
-        if (base == "sp" || base == abi.fp), regs.allSatisfy(calleeSaved) { return [] }   // prologue/epilogue saves
+        if frameSaves.contains(ins.address) { return [] }   // prologue saves and epilogue restores
 
         if !ins.dataRefs.isEmpty, base != "sp", base != abi.fp, regCount == 1 {
+            if isLoad, regs[0].hasPrefix("v"), size == 4 || size == 8, let lit = floatLiteral(ins.dataRefs[0], size) {
+                return [Stmt(kind: .set(regs[0], lit))]
+            }
             if isLoad, let v = slotValue(ins, size) { return [Stmt(kind: .set(regs[0], v))] }
             if !isLoad { return [Stmt(kind: .store(addrExpr(ins.dataRefs[0]), value(regs[0]), size))] }
         }
@@ -429,7 +500,9 @@ extension FunctionDecompiler {
             out.append(Stmt(kind: .set(base, .bin("+", .v(base), .c(off)))))
             accessOff = 0
         }
-        for k in 0..<regCount {
+        // `ldp x0, x1, [x0]`: both addresses use the old x0, so the load that overwrites the base goes last.
+        let order = isLoad && regCount == 2 && regs[0] == base ? [1, 0] : Array(0..<regCount)
+        for k in order {
             let o = accessOff &+ Int64(k * size)
             let loc: Loc
             if index == nil, let s = slot(base: base, off: o) {
@@ -459,8 +532,9 @@ extension FunctionDecompiler {
     static let x86Regs: [String: String] = {
         var d: [String: String] = [:]
         let legacy: [(String, [String])] = [
-            ("rax", ["eax", "ax", "al", "ah"]), ("rbx", ["ebx", "bx", "bl", "bh"]), ("rcx", ["ecx", "cx", "cl", "ch"]),
-            ("rdx", ["edx", "dx", "dl", "dh"]), ("rsi", ["esi", "si", "sil"]), ("rdi", ["edi", "di", "dil"]),
+            ("rax", ["eax", "ax", "al"]), ("rbx", ["ebx", "bx", "bl"]), ("rcx", ["ecx", "cx", "cl"]),
+            // ah/bh/ch/dh are bits 8-15: not modelled, so instructions using them stay asm.
+            ("rdx", ["edx", "dx", "dl"]), ("rsi", ["esi", "si", "sil"]), ("rdi", ["edi", "di", "dil"]),
             ("rbp", ["ebp", "bp", "bpl"]), ("rsp", ["esp", "sp", "spl"]), ("rip", []),
         ]
         for (q, names) in legacy { d[q] = q; for n in names { d[n] = q } }
@@ -487,21 +561,29 @@ extension FunctionDecompiler {
                     scale: inner.count > 2 ? Self.immediate(inner[2]) ?? 1 : 1, disp: disp)
     }
 
-    func liftX86(_ ins: Instruction) -> [Stmt] {
+    func liftX86(_ ins: Instruction, prev: Instruction?) -> [Stmt] {
         var m = ins.mnemonic
         var size = 8
         let ops = Self.splitOperands(ins.operands).map(parseX86)
         let regsUsed = Self.splitOperands(ins.operands).flatMap { $0.split(whereSeparator: { "%(),*$ ".contains($0) }) }.compactMap { Self.x86Regs[String($0)] }
-        let fallback = { self.asm(ins, defs: ops.last.flatMap { if case .reg(let r) = $0 { [r] } else { nil } } ?? [], uses: regsUsed) }
+        // Unmodelled integer instructions mostly set the flags; SSE ones don't. adc/sbb also read the carry.
+        let integer = !regsUsed.contains { $0.hasPrefix("xmm") }
+        let carry = m.hasPrefix("adc") || m.hasPrefix("sbb")
+        let fallback = {
+            self.keepEdge(ins, self.asm(ins, defs: (ops.last.flatMap { if case .reg(let r) = $0 { [r] } else { nil } } ?? []) + (integer ? ABI.flags : []),
+                                        uses: regsUsed + (carry ? ABI.flags : [])))
+        }
         if m == "endbr64" || m.hasPrefix("nop") { return [] }
         if ops.contains(.unsupported) { return fallback() }
 
         // Normalize mnemonic and operand size.
         var cc: String?
+        var zeroExtend = false
         if let last = m.last, let s = ["b": 1, "w": 2, "l": 4, "q": 8][String(last)], !Self.x86Bases.contains(m), Self.x86Bases.contains(String(m.dropLast())) {
             m = String(m.dropLast()); size = s
         } else if m.hasPrefix("movz") || m.hasPrefix("movs"), m.count == 6 {
             size = ["b": 1, "w": 2, "l": 4][String(m[m.index(m.startIndex, offsetBy: 4)])] ?? 8
+            zeroExtend = m.hasPrefix("movz")
             m = "mov"
         } else if m == "movabsq" {
             m = "mov"
@@ -556,18 +638,47 @@ extension FunctionDecompiler {
             default: return nil
             }
         }
-        func target(_ o: XOp) -> UInt64? { ins.target }
+        /// A floating-point source operand; a constant-pool load becomes its literal value.
+        func sseRead(_ o: XOp, _ size: Int) -> Expr? {
+            if case .mem(base: "rip", _, _, _) = o, let addr = ins.dataRefs.first, let lit = floatLiteral(addr, size) { return lit }
+            return read(o)
+        }
 
         switch m {
-        case "push", "pop", "leave", "cltq", "cwtl", "cdqe":
+        case "pop":
+            // `push $5; pop %rdi` is how -Oz loads small constants; other pushes and pops are frame bookkeeping.
+            if let prev, prev.mnemonic.hasPrefix("push"), ops.count == 1, let p = Self.splitOperands(prev.operands).first {
+                switch parseX86(p) {
+                case .imm(let k): return write(ops[0], .c(k)) ?? []
+                case .reg(let r) where r != "rbp": return write(ops[0], .v(r)) ?? []
+                default: break
+                }
+            }
             return []
+        case "push", "leave", "cltq", "cwtl", "cdqe":
+            return []
+        case "addsd", "addss", "subsd", "subss", "mulsd", "mulss", "divsd", "divss":
+            size = m.hasSuffix("sd") ? 8 : 4
+            guard ops.count == 2, let x = read(ops[1]), let y = sseRead(ops[0], size) else { return fallback() }
+            return write(ops[1], .bin(["add": "+", "sub": "-", "mul": "*", "div": "/"][String(m.prefix(3))]!, x, y)) ?? fallback()
+        case "movsd", "movss", "movaps", "movapd", "movups", "movupd", "movq", "movd", "cvtsi2sd", "cvtsi2ss", "cvtsi2sdl", "cvtsi2sdq",
+             "cvtsi2ssl", "cvtsi2ssq", "cvttsd2si", "cvttss2si", "cvtss2sd", "cvtsd2ss", "sqrtsd", "sqrtss":
+            size = m.hasSuffix("ss") || m.hasSuffix("2ss") || m == "movd" ? 4 : 8
+            guard ops.count == 2, let x = sseRead(ops[0], size) else { return fallback() }
+            return write(ops[1], m.hasPrefix("sqrt") ? .fn("sqrt", [x]) : x) ?? fallback()
+        case "xorps", "xorpd" where ops.count == 2 && ops[0] == ops[1]:
+            return write(ops[1], .c(0)) ?? fallback()
+        case "ucomiss", "ucomisd", "comiss", "comisd":
+            guard ops.count == 2, let x = read(ops[1]), let y = read(ops[0]) else { return fallback() }
+            return flags(x, y)
         case "ret":
             return [Stmt(kind: .ret(nil))]
         case "ud2", "int3", "hlt":
             return [Stmt(kind: .halt("__builtin_trap()"))]
         case "mov":
-            guard ops.count == 2, let s = read(ops[0]) else { return fallback() }
+            guard ops.count == 2, var s = read(ops[0]) else { return fallback() }
             if ops[0] == .reg("rsp"), ops[1] == .reg("rbp") { return [] }
+            if zeroExtend, case .reg = ops[0] { s = .bin("&", s, .c(size == 1 ? 0xff : 0xffff)) }
             return write(ops[1], s) ?? fallback()
         case "lea":
             guard ops.count == 2, let s = address(ops[0]) else { return fallback() }
@@ -579,7 +690,7 @@ extension FunctionDecompiler {
             if m == "xor", ops.count == 2, ops[0] == ops[1] { return (write(dst, .c(0)) ?? fallback()) }
             let src: Expr? = ops.count == 1 ? .c(1) : read(ops[0])
             guard let s = src, let dv = read(dst) else { return fallback() }
-            let o = ["add": "+", "sub": "-", "and": "&", "or": "|", "xor": "^", "imul": "*", "shl": "<<", "sal": "<<", "shr": ">>", "sar": ">>"][m]!
+            let o = ["add": "+", "sub": "-", "and": "&", "or": "|", "xor": "^", "imul": "*", "shl": "<<", "sal": "<<", "shr": ">>", "sar": "s>>"][m]!
             guard let w = write(dst, .bin(o, dv, s)) else { return fallback() }
             let result: Expr = if case .reg(let r) = dst { .v(r) } else { read(dst)! }
             return w + flags(result, .c(0))
@@ -607,6 +718,9 @@ extension FunctionDecompiler {
             return write(ops[1], .ite(c, s, dv)) ?? fallback()
         case "jcc":
             guard let cc, let c = condition(cc), let t = ins.target else { return fallback() }
+            if cc == "p" || cc == "np" {   // NaN test after ucomis*: reads the flags, keeps its edge
+                return keepEdge(ins, asm(ins, defs: [], uses: ABI.flags))
+            }
             return [Stmt(kind: .branch(c, t))]
         case "jmp", "call":
             guard ops.count == 1 else { return fallback() }
@@ -626,6 +740,13 @@ extension FunctionDecompiler {
         default:
             return fallback()
         }
+    }
+
+    func floatLiteral(_ addr: UInt64, _ size: Int) -> Expr? {
+        guard let sec = a.macho.section(containing: addr), sec.segment == "__TEXT", !sec.isCode, !sec.isCString,
+              let raw = try? a.macho.reader.bytes(Int(sec.offset) + Int(addr - sec.addr), size) else { return nil }
+        let v = raw.withUnsafeBytes { size == 8 ? $0.loadUnaligned(as: Double.self) : Double($0.loadUnaligned(as: Float.self)) }
+        return .raw(v == v.rounded() && abs(v) < 1e15 ? String(format: "%.1f", v) : "\(v)")
     }
 
     /// `jmp *slot(%rip)` through a GOT/stub slot is a tail call; `jmp *%reg` is usually a switch table.

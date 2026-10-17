@@ -204,7 +204,7 @@ public struct MachO: Sendable {
         var result: [UInt64: UInt64] = [:]
         for sec in sections where sec.isCode && sec.name.hasSuffix("stubs") && sec.name != "__objc_stubs" && sec.reserved2 > 0 {
             let size = UInt64(sec.reserved2)
-            for k in 0..<(sec.size / size) {
+            for k in 0..<min(sec.size / size, UInt64(data.count) / size) {   // size comes from the file
                 let addr = sec.addr + k * size, off = Int(sec.offset) + Int(k * size)
                 if arch == "x86_64" {   // jmp *disp32(%rip)
                     guard (try? reader.u16(off)) == 0x25ff, let disp = try? reader.u32(off + 2) else { continue }

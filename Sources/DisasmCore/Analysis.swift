@@ -266,7 +266,11 @@ public struct Analysis: Sendable {
         }
         if let addr { ins.dataRefs = [addr] }
         // Conservatively forget registers this instruction may overwrite.
-        if m.hasPrefix("bl") { pages.removeAll(); return }
+        // After a call or an unconditional transfer, the next instruction is reached from elsewhere: the pages
+        // tracked in address order no longer describe it.
+        if m.hasPrefix("bl") || ["b", "br", "braa", "brab", "braaz", "brabz", "ret", "retaa", "retab", "brk", "udf"].contains(m) {
+            pages.removeAll(); return
+        }
         if let d = ops.first.flatMap(reg) { pages[d] = nil }
         if m.hasPrefix("ldp") || m.hasPrefix("ldnp"), ops.count > 1, let d2 = reg(ops[1]) { pages[d2] = nil }
     }

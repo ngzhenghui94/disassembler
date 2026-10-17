@@ -79,7 +79,7 @@ struct Stmt {
         switch kind {
         case .set(_, let e), .eval(let e), .branch(let e, _), .ijump(let e): e.vars
         case .store(let a, let v, _): a.vars + v.vars
-        case .ret(let e): e?.vars ?? []
+        case .ret(let e): (e?.vars ?? []) + asmUses
         case .asm: asmUses
         case .jump, .halt: []
         }
@@ -120,13 +120,14 @@ struct Stmt {
 
 struct ABI {
     let args: [String], ret: String, clobbered: [String], sp: String, fp: String
+    let fpRet: String, otherRets: [String]   // float result register; second/float halves of larger results
     static let flags = ["cmp_l", "cmp_r"]
     static let arm64 = ABI(args: (0...7).map { "x\($0)" }, ret: "x0",
                            clobbered: (0...17).map { "x\($0)" } + (0...7).map { "v\($0)" } + (16...31).map { "v\($0)" } + flags,
-                           sp: "sp", fp: "x29")
+                           sp: "sp", fp: "x29", fpRet: "v0", otherRets: ["x1", "v0", "v1"])
     static let x86_64 = ABI(args: ["rdi", "rsi", "rdx", "rcx", "r8", "r9"], ret: "rax",
                             clobbered: ["rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11"] + (0...15).map { "xmm\($0)" } + flags,
-                            sp: "rsp", fp: "rbp")
+                            sp: "rsp", fp: "rbp", fpRet: "xmm0", otherRets: ["rdx", "xmm0", "xmm1"])
 }
 
 struct Block {
@@ -153,6 +154,7 @@ final class FunctionDecompiler {
     let abi: ABI
     var blocks: [Block] = []
     var index: [UInt64: Int] = [:]
+    var frameSaves = Set<UInt64>()
 
     init(_ a: Analysis, _ f: Function) {
         self.a = a
@@ -163,22 +165,37 @@ final class FunctionDecompiler {
 
     func run() -> [String] {
         let insns = Array(a.instructions[f.lines])
+        if isARM { frameSaves = computeFrameSaves(insns) }
         let lifted = insns.indices.map { k in
-            isARM ? liftARM(insns[k], next: k + 1 < insns.count ? insns[k + 1] : nil) : liftX86(insns[k])
+            isARM ? liftARM(insns[k], next: k + 1 < insns.count ? insns[k + 1] : nil) : liftX86(insns[k], prev: k > 0 ? insns[k - 1] : nil)
         }
         buildBlocks(insns, lifted)
         canonicalizeStackAddresses()
         inferCallArguments()
-        let returnsValue = blocks.contains { $0.stmts.contains { s in
-            if case .ret(_?) = s.kind { return true }   // tail call
-            return s.defs.contains(abi.ret)
-        } }
+        func assigns(_ r: String) -> Bool {
+            blocks.contains { $0.stmts.contains { s in
+                switch s.kind { case .set(r, _): true; case .asm: s.clobbers.contains(r); default: false }
+            } }
+        }
+        let tailCalls = blocks.contains { $0.stmts.contains { if case .ret(_?) = $0.kind { true } else { false } } }
+        // A function that never writes x0/rax but computes into v0/xmm0 returns a float.
+        let retReg = !assigns(abi.ret) && assigns(abi.fpRet) ? abi.fpRet : abi.ret
+        let returnsValue = tailCalls || assigns(abi.ret) || assigns(abi.fpRet)
         for b in blocks.indices {
             for s in blocks[b].stmts.indices {
-                if case .ret(nil) = blocks[b].stmts[s].kind, returnsValue { blocks[b].stmts[s].kind = .ret(.v(abi.ret)) }
+                guard case .ret(nil) = blocks[b].stmts[s].kind else { continue }
+                if returnsValue { blocks[b].stmts[s].kind = .ret(.v(retReg)) }
+                // The other result registers stay live so a struct or float result isn't deleted as dead.
+                blocks[b].stmts[s].asmUses = abi.otherRets.filter { $0 != retReg && assigns($0) }
             }
         }
-        let params = abi.args.indices.filter { liveness().liveIn[0].contains(abi.args[$0]) }
+        if !blocks[0].preds.isEmpty {
+            // The first block is a loop header: parameters must be read once, before the loop.
+            blocks.insert(Block(start: f.start &- 1), at: 0)
+            link()
+        }
+        let entryLive = liveness(conservative: false).liveIn[0]
+        let params = abi.args.indices.filter { entryLive.contains(abi.args[$0]) }
         let paramCount = (params.max() ?? -1) + 1
         blocks[0].stmts.insert(contentsOf: (0..<paramCount).map { Stmt(kind: .set(abi.args[$0], .v("arg\($0)"))) }, at: 0)
         copyFlagsIntoSuccessors()
@@ -215,7 +232,7 @@ final class FunctionDecompiler {
     }
 
     func link() {
-        index = Dictionary(uniqueKeysWithValues: blocks.enumerated().map { ($1.start, $0) })
+        index = Dictionary(blocks.enumerated().map { ($1.start, $0) }, uniquingKeysWith: { a, _ in a })
         for i in blocks.indices { blocks[i].preds = [] }
         for i in blocks.indices {
             let next = i + 1 < blocks.count ? [i + 1] : []
@@ -233,6 +250,7 @@ final class FunctionDecompiler {
     /// computed jump that could reach them, the blocks nothing reaches any more.
     func simplifyCFG() -> Bool {
         var changed = mergeBlocks()
+        let reachableBefore = Set(reachable().map { blocks[$0].start })
         for b in blocks.indices {
             guard case .branch(.c(let k), let t)? = blocks[b].stmts.last?.kind else { continue }
             if k == 0 { blocks[b].stmts.removeLast() } else { blocks[b].stmts[blocks[b].stmts.count - 1].kind = .jump(t) }
@@ -243,14 +261,21 @@ final class FunctionDecompiler {
         _ = mergeBlocks()
         let computed = blocks.contains { if case .ijump? = $0.stmts.last?.kind { true } else { false } }
         if !computed {
-            var seen: Set<Int> = [0], work = [0]
-            while let b = work.popLast() { for s in blocks[b].succs where seen.insert(s).inserted { work.append(s) } }
-            if seen.count < blocks.count {
-                blocks = blocks.indices.filter(seen.contains).map { blocks[$0] }
+            // Only drop what the folded branches cut off; blocks that were never reachable (landing pads) stay.
+            let seen = reachable()
+            let dead = blocks.indices.filter { !seen.contains($0) && reachableBefore.contains(blocks[$0].start) }
+            if !dead.isEmpty {
+                blocks = blocks.indices.filter { !dead.contains($0) }.map { blocks[$0] }
                 link()
             }
         }
         return true
+    }
+
+    func reachable() -> Set<Int> {
+        var seen: Set<Int> = [0], work = [0]
+        while let b = work.popLast() { for s in blocks[b].succs where seen.insert(s).inserted { work.append(s) } }
+        return seen
     }
 
     /// Joins a block into its predecessor when it is that block's only successor and only reached from it.
@@ -258,7 +283,8 @@ final class FunctionDecompiler {
         var merged = false
         var i = blocks.count - 2
         while i >= 0 {
-            if blocks[i].succs == [i + 1], blocks[i + 1].preds == [i] {
+            let branches: Bool = if case .branch? = blocks[i].stmts.last?.kind { true } else { false }
+            if blocks[i].succs == [i + 1], blocks[i + 1].preds == [i], !branches {
                 if case .jump? = blocks[i].stmts.last?.kind { blocks[i].stmts.removeLast() }
                 blocks[i].stmts += blocks[i + 1].stmts
                 blocks[i].succs = blocks[i + 1].succs
@@ -275,7 +301,7 @@ final class FunctionDecompiler {
     /// second block (when its operands are unchanged) lets both tests fold into plain conditions.
     func copyFlagsIntoSuccessors() {
         let liveIn = liveness().liveIn
-        for b in blocks.indices where blocks[b].preds.count == 1 && ABI.flags.allSatisfy(liveIn[b].contains) {
+        for b in blocks.indices where blocks[b].preds.count == 1 && blocks[b].preds[0] != b && ABI.flags.allSatisfy(liveIn[b].contains) {
             let p = blocks[b].preds[0], st = blocks[p].stmts
             var copies: [Stmt] = []
             for flag in ABI.flags {
@@ -323,9 +349,15 @@ final class FunctionDecompiler {
                     stackArgs[k] = s
                 }
                 if case .set(abi.args[1], .raw(let r)) = st.kind, r.hasPrefix("@selector(") { selector = String(r.dropFirst(10).dropLast()) }
-                // A register written and then consumed before the call was scratch, not an argument.
-                let flagWrite: Bool = if case .set(let n, _) = st.kind { n.hasPrefix("cmp_") } else { false }
-                if !flagWrite { for u in st.uses { if let i = abi.args.firstIndex(of: u) { defined.remove(i) } } }
+                // A register that is compared, or copied into another argument register, before the call was
+                // scratch. Reads that feed something else (`ldr x8, [x0]` for a method call on x0) keep it.
+                let isFlags: Bool = if case .set(let n, _) = st.kind { n.hasPrefix("cmp_") } else { false }
+                let flagsOfPrevious = isFlags && s > 0 && !Set(blocks[b].stmts[s - 1].defs).isDisjoint(with: st.uses)
+                let definesArg = st.defs.contains(where: abi.args.contains)
+                for u in st.uses {
+                    guard let i = abi.args.firstIndex(of: u) else { continue }
+                    if (isFlags && !flagsOfPrevious) || (definesArg && !st.defs.contains(u)) { defined.remove(i) }
+                }
                 for d in st.defs { if let i = abi.args.firstIndex(of: d) { defined.insert(i) } }
             }
         }
@@ -376,7 +408,9 @@ final class FunctionDecompiler {
 
     // MARK: - Dataflow
 
-    func liveness() -> (liveIn: [Set<String>], liveOut: [Set<String>]) {
+    /// `conservative` also counts what computed jumps and jumps out of the function might read: right for deleting
+    /// code, too generous for guessing parameters (switch-table bytes decoded as code read everything).
+    func liveness(conservative: Bool = true) -> (liveIn: [Set<String>], liveOut: [Set<String>]) {
         let n = blocks.count
         var gen = [Set<String>](repeating: [], count: n), kill = gen
         for b in 0..<n {
@@ -385,13 +419,24 @@ final class FunctionDecompiler {
                 kill[b].formUnion(s.defs)
             }
         }
+        // A computed jump (switch table) can reach any block nothing else reaches; a jump out of the function is a
+        // tail call that may read the argument registers.
+        let orphans = (1..<max(n, 1)).filter { blocks[$0].preds.isEmpty }
+        var extra = [Set<String>](repeating: [], count: n), extraSuccs = [[Int]](repeating: [], count: n)
+        for b in 0..<n where conservative {
+            switch blocks[b].stmts.last?.kind {
+            case .ijump?: extraSuccs[b] = orphans
+            case .jump(let t)?, .branch(_, let t)?: if index[t] == nil { extra[b] = Set(abi.args) }
+            default: break
+            }
+        }
         var liveIn = gen, liveOut = [Set<String>](repeating: [], count: n)
         var changed = true
         while changed {
             changed = false
             for b in (0..<n).reversed() {
-                var out = Set<String>()
-                for s in blocks[b].succs { out.formUnion(liveIn[s]) }
+                var out = extra[b]
+                for s in blocks[b].succs + extraSuccs[b] { out.formUnion(liveIn[s]) }
                 let inn = gen[b].union(out.subtracting(kill[b]))
                 if inn != liveIn[b] || out != liveOut[b] { liveIn[b] = inn; liveOut[b] = out; changed = true }
             }
@@ -489,6 +534,7 @@ final class FunctionDecompiler {
         }
         guard count == 1, let j = first, redefined || !liveOut.contains(r) else { return false }
         if case .asm = st[j].kind { return false }
+        guard st[j].exprs.contains(where: { $0.vars.contains(r) }) else { return false }
         let ev = Set(e.vars), reads = e.readsMemory, calls = e.hasCall
         let blocked = st[(i + 1)..<j].contains { m in
             !ev.isDisjoint(with: m.defs) || (reads && m.writesMemory) || (calls && m.exprs.contains { $0.readsMemory })
@@ -555,13 +601,12 @@ final class FunctionDecompiler {
                 falls = true
                 if i == skipBranchOf { falls = false; i += 1; continue }
                 guard let ti = index[t] else { line("if (\(render(c))) goto 0x\(String(t, radix: 16));", ind); i += 1; continue }
-                let inRegion = { (x: Int) in x < r.to || x == r.follow }
                 if ti == r.loopExit { line("if (\(render(c))) break;", ind); i += 1 }
                 else if ti == r.loopHead { line("if (\(render(c))) continue;", ind); i += 1 }
                 else if ti == i + 1 { i += 1 }
-                else if ti > i + 1, inRegion(ti) {
+                else if ti > i + 1, ti <= r.to {
                     var inner = r
-                    if case .jump(let e)? = blocks[ti - 1].stmts.last?.kind, let ei = index[e], ei > ti, inRegion(ei) {
+                    if case .jump(let e)? = blocks[ti - 1].stmts.last?.kind, let ei = index[e], ei > ti, ei <= r.to {
                         inner.to = ti; inner.follow = ei
                         line("if (\(render(negate(c)))) {", ind)
                         emit(i + 1, inner, ind + 1)
@@ -577,6 +622,13 @@ final class FunctionDecompiler {
                         line("}", ind)
                         i = ti
                     }
+                } else if ti == r.follow, ti > r.to {
+                    // Taken, the branch leaves for the block after this region; the rest of the region runs otherwise.
+                    line("if (\(render(negate(c)))) {", ind)
+                    emit(i + 1, r, ind + 1)
+                    line("}", ind)
+                    i = r.to
+                    falls = false
                 } else if isInlinableExit(ti) {
                     line("if (\(render(c))) {", ind)
                     emitInline(ti, ind + 1)
@@ -623,7 +675,8 @@ final class FunctionDecompiler {
     func emitLoop(_ h: Int, _ l: Int, _ r: Region, _ ind: Int) -> Int {
         let x = l + 1
         let body = Region(to: x, follow: h, loopHead: h, loopExit: x)
-        if case .branch(let c, let t)? = blocks[l].stmts.last?.kind, index[t] == h {
+        let otherBackEdges = blocks[h].preds.contains { $0 >= h && $0 < l }
+        if case .branch(let c, let t)? = blocks[l].stmts.last?.kind, index[t] == h, !otherBackEdges {
             line("do {", ind)
             emit(h, body, ind + 1, noLoopAt: h, skipBranchOf: l)
             line("} while (\(render(c)));", ind)
@@ -657,7 +710,7 @@ final class FunctionDecompiler {
     }
 
     static let precedence: [String: Int] = [
-        "*": 3, "/": 3, "%": 3, "+": 4, "-": 4, "<<": 5, ">>": 5, "<": 6, "<=": 6, ">": 6, ">=": 6,
+        "*": 3, "/": 3, "%": 3, "+": 4, "-": 4, "<<": 5, ">>": 5, "s>>": 5, "<": 6, "<=": 6, ">": 6, ">=": 6,
         "==": 7, "!=": 7, "&": 8, "^": 9, "|": 10, "&&": 11, "||": 12,
     ]
 
@@ -676,7 +729,7 @@ final class FunctionDecompiler {
         case .ite(let c, let x, let y): return ("\(wrap(c, 12)) ? \(wrap(x, 13)) : \(wrap(y, 13))", 13)
         case .bin(let o, let x, let y):
             let p = Self.precedence[o] ?? 13
-            return ("\(wrap(x, p)) \(o) \(wrap(y, p - 1))", p)
+            return ("\(wrap(x, p)) \(o == "s>>" ? ">>" : o) \(wrap(y, p - 1))", p)
         case .call(let t, let args): return (renderCall(t, args), 0)
         case .load(let addr, let size):
             if let slot = stackSlot(addr) { return (slot, 0) }
@@ -733,6 +786,7 @@ final class FunctionDecompiler {
             case "\r": out += "\\r"
             case "\"": out += "\\\""
             case "\\": out += "\\\\"
+            case _ where ch.value < 0x20 || ch.value == 0x7f: out += String(format: "\\x%02x", ch.value)
             default: out.unicodeScalars.append(ch)
             }
         }
@@ -765,6 +819,7 @@ func fold(_ o: String, _ x: Int64, _ y: Int64) -> Int64? {
     case "^": x ^ y
     case "<<": (0..<64).contains(y) ? x << y : nil
     case ">>": (0..<64).contains(y) ? Int64(bitPattern: UInt64(bitPattern: x) >> UInt64(y)) : nil
+    case "s>>": (0..<64).contains(y) ? x >> y : nil
     case "/": y != 0 && !(x == .min && y == -1) ? x / y : nil
     case "%": y != 0 && !(x == .min && y == -1) ? x % y : nil
     case "==": x == y ? 1 : 0
@@ -784,7 +839,7 @@ func simplifyNode(_ e: Expr) -> Expr {
     case .bin(let o, .c(let x), .c(let y)):
         if let r = fold(o, x, y) { return .c(r) }
     case .bin("+", let x, .c(0)), .bin("-", let x, .c(0)), .bin("|", let x, .c(0)), .bin("^", let x, .c(0)),
-         .bin("<<", let x, .c(0)), .bin(">>", let x, .c(0)), .bin("*", let x, .c(1)), .bin("/", let x, .c(1)),
+         .bin("<<", let x, .c(0)), .bin(">>", let x, .c(0)), .bin("s>>", let x, .c(0)), .bin("*", let x, .c(1)), .bin("/", let x, .c(1)),
          .bin("+", .c(0), let x), .bin("|", .c(0), let x):
         return x
     case .bin("&", let x, let y) where x == y, .bin("|", let x, let y) where x == y:
@@ -811,9 +866,9 @@ func simplifyNode(_ e: Expr) -> Expr {
          .bin("<=", .c(1), let x) where isBoolean(x):
         return x
     case .bin("&&", .c(let k), let x), .bin("&&", let x, .c(let k)):
-        return k == 0 ? .c(0) : x
+        return k == 0 ? .c(0) : isBoolean(x) ? x : .bin("!=", x, .c(0))
     case .bin("||", .c(let k), let x), .bin("||", let x, .c(let k)):
-        return k != 0 ? .c(1) : x
+        return k != 0 ? .c(1) : isBoolean(x) ? x : .bin("!=", x, .c(0))
     case .bin(let o, .bin("-", let x, let y), .c(0)) where inverse[o] != nil:
         return .bin(o, x, y)   // flags from subs: (a - b) < 0 → a < b
     case .bin("!=", let x, .c(0)) where isBoolean(x):
