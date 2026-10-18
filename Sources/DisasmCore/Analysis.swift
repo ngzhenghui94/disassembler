@@ -82,8 +82,12 @@ public struct Analysis: Sendable {
         var ins = Self.parseOtool(try Self.otool(text), symbolAddress)
         // otool decodes jump tables in __text as (junk) instructions; the file marks them as data.
         if !macho.dataInCode.isEmpty {
-            let ranges = macho.dataInCode.map { $0.addr..<($0.addr + UInt64($0.length)) }
-            ins.removeAll { i in ranges.contains { $0.contains(i.address) } }
+            let ranges = macho.dataInCode.map { $0.addr..<($0.addr + UInt64($0.length)) }.sorted { $0.lowerBound < $1.lowerBound }
+            var r = 0   // both lists are in address order: one pass
+            ins.removeAll { i in
+                while r < ranges.count, ranges[r].upperBound <= i.address { r += 1 }
+                return r < ranges.count && ranges[r].contains(i.address)
+            }
         }
         var stubs: [UInt64: String] = [:]
         for i in ins where i.target != nil && i.comment.hasPrefix("symbol stub for: ") {

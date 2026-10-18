@@ -178,9 +178,10 @@ final class FunctionDecompiler {
         copyFlagsIntoSuccessors()
         optimize()
         let recovered = recoverSwitches()
-        if convertIndirectTailCalls(paramCount) { optimize() }
-        if recovered {
-            // Case bodies are reachable now, and may read incoming arguments nothing else did.
+        let tailCalls = convertIndirectTailCalls(paramCount)
+        if recovered || tailCalls {
+            // Case bodies are reachable now and tail calls read argument registers: either may read incoming
+            // arguments nothing else did.
             let live = liveness(conservative: false).liveIn[0]
             let more = ((abi.args.indices.filter { live.contains(abi.args[$0]) }.max() ?? -1) + 1)
             if more > paramCount {
@@ -392,6 +393,8 @@ final class FunctionDecompiler {
                 let last = blocks[g.pred].stmts.count - 1
                 if g.into { blocks[g.pred].stmts[last].kind = .jump(blocks[b].start) } else { blocks[g.pred].stmts.remove(at: last) }
             }
+            // With only the speculation clamp, an out-of-range index reads entry 0: that case is the default too.
+            if guardInfo == nil, clampCount != nil { defaultTarget = targets[0] }
             blocks[b].stmts[blocks[b].stmts.count - 1].kind = .switchJump(table.index, targets, defaultTarget)
             changed = true
         }
@@ -406,6 +409,8 @@ final class FunctionDecompiler {
         var changed = false
         for b in blocks.indices {
             guard case .ijump(let e)? = blocks[b].stmts.last?.kind else { continue }
+            let values = blockValues(b)
+            if matchJumpTable(simplify(e.map { if case .v(let n) = $0, let v = values[n] { v } else { $0 } })) != nil { continue }
             var defined = Set<Int>()
             for st in blocks[b].stmts { for d in st.defs { if let i = abi.args.firstIndex(of: d) { defined.insert(i) } } }
             let k = max(defined.max() ?? -1, paramCount - 1)
@@ -432,9 +437,15 @@ final class FunctionDecompiler {
     func constValue(_ e: Expr) -> Int64? {
         switch e {
         case .c(let k): return k
-        case .global(let n): return a.names.first { $0.value == n }.map { Int64(bitPattern: $0.key) }
+        case .global(let n): return uniqueAddress(of: n).map { Int64(bitPattern: $0) }
         default: return nil
         }
+    }
+
+    /// A name's address, unless several addresses share it (local symbols, demangled duplicates).
+    func uniqueAddress(of name: String) -> UInt64? {
+        let hits = a.names.filter { $0.value == name }
+        return hits.count == 1 ? hits.first!.key : nil
     }
 
     /// Matches `C + (load(T + I*size) << shift)` (arm64: byte/halfword offsets from an anchor; x86: int32 offsets from the table).
@@ -469,7 +480,10 @@ final class FunctionDecompiler {
         for p in blocks[b].preds {
             guard case .branch(let c, let t)? = blocks[p].stmts.last?.kind, case .bin(var op, var x, var y) = c else { continue }
             if case .c = x { swap(&x, &y); op = ["<": ">", ">": "<", "<=": ">=", ">=": "<="][op] ?? op }
-            guard x == i, case .c(let n) = y, n >= 0, n < 4096 else { continue }
+            // Both sides in terms of what the guard block computed: `x16` here and `x0 - 0x25` there are the same.
+            let values = blockValues(p)
+            let canon = { (e: Expr) in simplify(e.map { if case .v(let n) = $0, let v = values[n] { v } else { $0 } }) }
+            guard x == i || canon(x) == canon(i), case .c(let n) = y, n >= 0, n < 4096 else { continue }
             let into = index[t] == b
             let other = into ? (p + 1 < blocks.count ? blocks[p + 1].start : nil) : t
             switch (op, into) {
@@ -567,15 +581,18 @@ final class FunctionDecompiler {
         return nil
     }
 
+    static let ambiguous = UInt64.max   // calleeAddress value when two callees share a name
     nonisolated(unsafe) static let parameterCache = NSCache<NSString, NSNumber>()
 
     /// Argument count of a callee: a known C/runtime function, or what this decompiler infers for an internal one.
     func signature(_ t: Expr) -> (count: Int, variadic: Bool)? {
         guard case .global(let raw) = t else { return nil }
-        if let sig = Signatures.known[pretty(raw)] { return sig }
-        guard !light, let addr = calleeAddress[raw], let callee = a.function(containing: addr), callee.start == addr,
-              callee.start != f.start else { return nil }
-        let key = "\(a.macho.uuid?.uuidString ?? "-")|\(a.macho.arch)|\(a.instructions.count)|\(addr)" as NSString
+        // A function defined in this binary is its own signature, even when it shares a libc name.
+        guard let addr = calleeAddress[raw], addr != Self.ambiguous, let callee = a.function(containing: addr), callee.start == addr else {
+            return Signatures.known[pretty(raw)]
+        }
+        guard !light, callee.start != f.start else { return nil }
+        let key = "\(a.macho.uuid?.uuidString ?? "-")|\(a.macho.arch)|\(a.macho.data.count)|\(a.instructions.count)|\(addr)" as NSString
         if let n = Self.parameterCache.object(forKey: key) { return (n.intValue, true) }
         let n = FunctionDecompiler(a, callee, light: true).prepare().paramCount
         Self.parameterCache.setObject(NSNumber(value: n), forKey: key)

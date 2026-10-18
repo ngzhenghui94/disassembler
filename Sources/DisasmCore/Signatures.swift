@@ -18,7 +18,7 @@ enum Signatures {
                 "NSStringFromSelector", "NSClassFromString", "NSSelectorFromString", "_Block_copy", "_Block_release",
                 "swift_retain", "swift_release", "swift_bridgeObjectRetain", "swift_bridgeObjectRelease", "swift_unknownObjectRetain",
                 "swift_unknownObjectRelease", "swift_endAccess", "swift_errorRelease", "swift_errorRetain",
-                "swift_isUniquelyReferenced_nonNull_native", "CFRelease", "CFRetain",
+                "swift_isUniquelyReferenced_nonNull_native", "swift_task_alloc", "swift_task_dealloc", "CFRelease", "CFRetain",
                 "dispatch_release", "dispatch_retain", "os_release", "os_retain"],
             2: ["strcmp", "swift_dynamicCastClass", "swift_getKeyPath", "strcpy", "strcat", "strchr", "strrchr", "strstr", "strspn", "strcspn", "strpbrk", "calloc", "realloc",
                 "fputs", "fopen", "fputc", "putc", "rename", "access", "mkdir", "stat", "lstat", "fstat", "kill", "signal",
@@ -37,8 +37,8 @@ enum Signatures {
         ]
         for (n, names) in fixed { for name in names { d[name] = (n, false) } }
         let variadic: [Int: [String]] = [
-            1: ["printf", "NSLog", "scanf", "open"],
-            2: ["fprintf", "sprintf", "asprintf", "sscanf", "fscanf", "syslog", "fcntl", "ioctl", "dprintf"],
+            1: ["printf", "NSLog", "scanf"],
+            2: ["open", "fprintf", "sprintf", "asprintf", "sscanf", "fscanf", "syslog", "fcntl", "ioctl", "dprintf"],
             3: ["snprintf"],
         ]
         for (n, names) in variadic { for name in names { d[name] = (n, true) } }

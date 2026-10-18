@@ -94,7 +94,7 @@ extension FunctionDecompiler {
 
     func callee(_ t: UInt64) -> Expr {
         let name = a.name(of: t)
-        calleeAddress[name] = t
+        if let seen = calleeAddress[name], seen != t { calleeAddress[name] = Self.ambiguous } else { calleeAddress[name] = t }
         return .global(name)
     }
 
@@ -195,6 +195,29 @@ extension FunctionDecompiler {
         return consumers.contains(ins.mnemonic) ? Self.splitOperands(ins.operands).last : nil
     }
 
+    /// Conditions every reader of the current flags tests, along the fallthrough and into the targets of
+    /// conditional branches, until something rewrites the flags or control leaves.
+    static func flagReaders(_ start: ArraySlice<Instruction>, _ at: (UInt64) -> ArraySlice<Instruction>?) -> [String] {
+        let writers: Set<String> = ["cmp", "cmn", "tst", "fcmp", "fcmpe", "adds", "subs", "ands", "bics", "negs", "ngcs", "adcs", "sbcs",
+                                    "ccmp", "ccmn", "fccmp", "fccmpe"]
+        let consumers: Set<String> = ["csel", "fcsel", "csinc", "csinv", "csneg", "cset", "csetm", "cinc", "cinv", "cneg", "ccmp", "ccmn", "fccmp", "fccmpe"]
+        var found: [String] = [], work = [start], seen = Set<UInt64>()
+        while let run = work.popLast() {
+            for ins in run.prefix(64) {
+                guard seen.insert(ins.address).inserted else { break }
+                let m = ins.mnemonic
+                if m.hasPrefix("b.") || m.hasPrefix("bc.") {
+                    found.append(String(m.split(separator: ".", maxSplits: 1).last ?? ""))
+                    if let t = ins.target, let next = at(t) { work.append(next) }
+                } else if consumers.contains(m), let cc = splitOperands(ins.operands).last {
+                    found.append(cc)
+                }
+                if writers.contains(m) || m.hasPrefix("bl") || ["b", "br", "braa", "brab", "ret", "retaa", "retab"].contains(m) { break }
+            }
+        }
+        return found
+    }
+
     static func nzcvSatisfies(_ cc: String, _ f: Int64) -> Bool? {
         let n = f & 8 != 0, z = f & 4 != 0, c = f & 2 != 0, v = f & 1 != 0
         switch cc {
@@ -222,13 +245,11 @@ extension FunctionDecompiler {
         let alias = ["cs": "hs", "cc": "lo"]
         let complement = ["eq": "ne", "ne": "eq", "hs": "lo", "lo": "hs", "hi": "ls", "ls": "hi", "ge": "lt", "lt": "ge", "gt": "le", "le": "gt"]
         let asked = alias[cc2] ?? cc2
-        let flagWriters: Set<String> = ["cmp", "cmn", "tst", "fcmp", "fcmpe", "adds", "subs", "ands", "bics", "negs", "ngcs", "adcs", "sbcs",
-                                        "ccmp", "ccmn", "fccmp", "fccmpe"]
-        for later in following.prefix(64) {
-            let m = later.mnemonic
-            if let cc = consumerCondition(later).map({ alias[$0] ?? $0 }), cc != asked, cc != complement[asked] { return nil }
-            if flagWriters.contains(m) || m.hasPrefix("bl") || ["b", "br", "braa", "brab", "ret", "retaa", "retab"].contains(m) { break }
+        let readers = Self.flagReaders(following) { addr in
+            let i = Analysis.lowerBound(self.a.instructions, addr)
+            return i < self.a.instructions.count && self.a.instructions[i].address == addr && self.inside(addr) ? self.a.instructions[i...] : nil
         }
+        for cc in readers.map({ alias[$0] ?? $0 }) where cc != asked && cc != complement[asked] { return nil }
         if ins.mnemonic == "ccmn" { y = .un("-", y) }
         let test = c2.map { $0 == .v("cmp_l") ? x : $0 == .v("cmp_r") ? y : $0 }
         let result: Expr = holds ? .bin("||", negate(c1), test) : .bin("&&", c1, test)
@@ -313,7 +334,9 @@ extension FunctionDecompiler {
         }
         let d = ops.first.flatMap { armReg($0) }
         func set(_ e: Expr) -> [Stmt] {
-            guard let d, d != "zr", d != "sp" else { return [] }
+            // x29 is reserved for the frame pointer on Apple arm64; writes to it (frame setup, Swift's async-frame bit)
+            // are bookkeeping, never program data.
+            guard let d, d != "zr", d != "sp", d != abi.fp else { return [] }
             return [Stmt(kind: .set(d, e))]
         }
         func op(_ k: Int) -> Expr? { armOperand(ops, k) }

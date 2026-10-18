@@ -99,7 +99,8 @@ func decompilerRegressions(arch: String) throws {
     let fret = try code(a, "_fret"), sw = try code(a, "_sw"), getmsg = try code(a, "_getmsg"), fcmp = try code(a, "_fcmp")
     #expect(fret.contains("return") && fret.contains("*") && !fret.hasPrefix("void"), "float result kept: \(fret)")
     // x86 dispatches through a jump table: `rax = y * 3` must survive the computed jump.
-    #expect(arch == "x86_64" ? sw.contains("rax = rsi + rsi * 2") : sw.contains("arg1 + (arg1 << 1)"), "value used by switch cases kept: \(sw)")
+    #expect(arch == "x86_64" ? sw.contains("rax = rsi + rsi * 2") || sw.contains("rax = arg1 + arg1 * 2") : sw.contains("arg1 + (arg1 << 1)"),
+            "value used by switch cases kept: \(sw)")
     #expect(getmsg.contains("return msg;"), "mutable global is read, not replaced by its initializer: \(getmsg)")
     #expect(!fcmp.contains("cmp_l") && !fcmp.contains("asm"), "float compare modelled: \(fcmp)")
 
@@ -129,11 +130,34 @@ func decompilerRegressions(arch: String) throws {
 @Test func conditionalCompareAnswersOneQuestion() throws {
     let a = try Analysis(slice: fixture(arch: "arm64", strip: false))
     let d = FunctionDecompiler(a, a.functions[0])
-    func ins(_ m: String, _ o: String) -> Instruction { Instruction(address: 0, bytes: "", mnemonic: m, operands: o, comment: "", target: nil) }
+    var next: UInt64 = 0x1000
+    func ins(_ m: String, _ o: String) -> Instruction {
+        next += 4
+        return Instruction(address: next, bytes: "", mnemonic: m, operands: o, comment: "", target: nil)
+    }
     let ccmp = ins("ccmp", "x1, #0x2, #0x0, eq")
     let folded = { (s: [Stmt]) in s.contains { if case .set("cmp_t", _) = $0.kind { true } else { false } } }
     #expect(folded(d.liftARM(ccmp, following: [ins("b.ne", "0x10"), ins("cset", "w0, eq")][...])))
     #expect(!folded(d.liftARM(ccmp, following: [ins("b.ne", "0x10"), ins("cset", "w0, lt")][...])))
     #expect(folded(d.liftARM(ccmp, following: [ins("b.ne", "0x10"), ins("cmp", "x3, #0x1"), ins("cset", "w0, lt")][...])),
             "a later compare ends the old flags")
+}
+
+/// Flag readers are found along the fallthrough and at conditional-branch targets, up to the next flag write.
+@Test func flagReadersFollowBranches() {
+    func ins(_ addr: UInt64, _ m: String, _ o: String, _ t: UInt64? = nil) -> Instruction {
+        Instruction(address: addr, bytes: "", mnemonic: m, operands: o, comment: "", target: t)
+    }
+    let code = [ins(0, "b.ne", "0x20", 0x20), ins(4, "cset", "w0, eq"), ins(8, "cmp", "x1, #0x3"), ins(12, "cset", "w2, lt"),
+                ins(0x20, "csel", "x0, x1, x2, lt"), ins(0x24, "ret", "")]
+    let at = { (a: UInt64) -> ArraySlice<Instruction>? in code.firstIndex { $0.address == a }.map { code[$0...] } }
+    #expect(FunctionDecompiler.flagReaders(code[...], at).sorted() == ["eq", "lt", "ne"], "lt at the branch target, not after the cmp")
+}
+
+/// x29 is the frame pointer on Apple arm64: Swift's async-frame marking of it is not program data.
+@Test func framePointerWritesAreBookkeeping() throws {
+    let a = try Analysis(slice: fixture(arch: "arm64", strip: false))
+    let d = FunctionDecompiler(a, a.functions[0])
+    let orr = Instruction(address: 0x1000, bytes: "", mnemonic: "orr", operands: "x29, x29, #0x1000000000000000", comment: "", target: nil)
+    #expect(d.liftARM(orr, following: [][...]).isEmpty)
 }
