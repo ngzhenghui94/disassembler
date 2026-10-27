@@ -9,7 +9,7 @@ extension ProviderServer {
         ("debug_breakpoint", "Set, enable/disable or remove an address, symbol or exception breakpoint. Addresses are hexadecimal file addresses, not runtime addresses. Use the returned id to remove a breakpoint."),
         ("debug_memory", "Read 1–65536 bytes from a stopped process. expression is a runtime address, register such as $pc, or LLDB expression. The memory event in debug_state carries the matching requestID, address and hex bytes or error."),
         ("frida_attach", "Attach Frida to an authorized PID through USB (device ID optional) or an existing localhost port forward to Frida Server/Gadget. Requires matching Frida Python bindings and target server/Gadget. Does not root or modify app packages. Poll frida_events for attached/modules or errors."),
-        ("frida_trace", "Add/remove a native function trace. Supply loaded module name and either exported symbol or hex offset from module base (not a file offset). Captures 0–8 raw pointer-sized arguments and return value on return. At most 64 hooks and 100 calls/sec; dropped events are reported. No Java hooks or stepping; use LLDB for breakpoints/stepping."),
+        ("frida_trace", "Add/remove a native function trace. Supply loaded module name and either exported symbol or hex offset from module base (not a file offset). Captures 0–8 raw pointer-sized arguments and, at function entries, the return value. Offsets that are not exports or functions in this analysis report retval null unless function_start is true; set it only for a real function entry, since a mid-function return hook can crash the target. Distinct traces must be 16+ bytes apart. At most 64 hooks and 100 calls/sec; dropped events are reported. No Java hooks or stepping; use LLDB for breakpoints/stepping."),
         ("frida_events", "Read Frida status and cursor-based events: attached includes loaded modules, hook confirms runtime address, trace includes thread/args/retval, error includes requestID. Retains 200 events, reports buffer drops and sampling drops. Poll after=cursor."),
         ("frida_detach", "Unload this session's Frida hooks and detach without terminating the target process."),
     ]
@@ -53,7 +53,7 @@ extension ProviderServer {
         case "frida_trace":
             p.merge(["action": ["type": "string", "enum": ["add", "remove"]], "id": string,
                      "module": string, "symbol": string, "offset": string,
-                     "argument_count": ["type": "integer", "minimum": 0, "maximum": 8]]) { _, n in n }
+                     "argument_count": ["type": "integer", "minimum": 0, "maximum": 8], "function_start": ["type": "boolean"]]) { _, n in n }
         case "frida_events":
             p["after"] = ["type": "integer", "minimum": 0]
             p["wait_ms"] = ["type": "integer", "minimum": 0, "maximum": 1000]
@@ -103,7 +103,13 @@ extension ProviderServer {
         if name.hasPrefix("frida_") {
             guard let tracer = tracers[s.id] else { throw MachOError(message: "Call frida_attach first") }
             switch name {
-            case "frida_trace": return try tracer.trace(a)
+            case "frida_trace":
+                // An offset at a function this analysis knows is safe to trace to its return.
+                var a = a
+                if a["module"] as? String == URL(fileURLWithPath: s.inputPath).lastPathComponent,
+                   let offset = a["offset"] as? String, let n = UInt64(offset.hasPrefix("0x") ? String(offset.dropFirst(2)) : offset, radix: 16),
+                   s.analysis.functions.contains(where: { $0.start == n }) { a["function_start"] = true }
+                return try tracer.trace(a)
             case "frida_detach":
                 return tracer.detach()
             default:

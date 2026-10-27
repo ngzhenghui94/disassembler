@@ -41,6 +41,8 @@ import Testing
     let command = try FridaSession.traceCommand(["module": "lib.so", "offset": "0x123", "argument_count": 0])
     #expect(command["offset"] as? String == "123")
     #expect(command["count"] as? Int == 0)
+    #expect(command["function_start"] as? Bool == false)
+    #expect(try FridaSession.traceCommand(["module": "lib.so", "offset": "10", "function_start": true])["function_start"] as? Bool == true)
 }
 
 @Test func fridaRejectsAmbiguousUSBDevices() throws {
@@ -123,4 +125,13 @@ exec(sys.argv[1])
         #expect(result["state"] as? String != "error", "\(result)")
     }
     Issue.record("Library breakpoint never stopped in its host executable")
+}
+
+@Test func fridaCommandsAfterHelperExitDoNotKillHost() throws {
+    let session = try FridaSession(options: ["pid": 1, "python_path": "/usr/bin/false"])
+    #expect(session.status(waitMS: 1000)["state"] as? String == "detached")
+    usleep(100_000)
+    // Without SIGPIPE ignored, writing to the exited helper terminates the test process.
+    _ = try session.trace(["module": "lib.so", "symbol": "f"])
+    _ = session.detach()
 }

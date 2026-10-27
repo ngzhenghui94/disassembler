@@ -33,6 +33,7 @@ public final class FridaSession: @unchecked Sendable {
             if data.isEmpty { h.readabilityHandler = nil; log.append(["event": "detached"]); return }
             self?.consume(data)
         }
+        signal(SIGPIPE, SIG_IGN)   // a write after Python exits must fail, not kill the host
         try process.run()
         var command: [String: Any] = ["cmd": "attach", "pid": pid, "device": device]
         if let port { command["port"] = port }
@@ -83,7 +84,8 @@ public final class FridaSession: @unchecked Sendable {
             throw MachOError(message: "Trace action must be add/remove; add requires a loaded module name")
         }
         let count = try DebugController.integer(a["argument_count"] ?? 4, name: "argument_count", range: 0...8)
-        var c: [String: Any] = ["cmd": "add", "id": UUID().uuidString, "module": module, "count": count]
+        var c: [String: Any] = ["cmd": "add", "id": UUID().uuidString, "module": module, "count": count,
+                                "function_start": a["function_start"] as? Bool ?? false]
         if let symbol = a["symbol"] as? String, !symbol.isEmpty, symbol.count <= 4096, a["offset"] == nil {
             c["symbol"] = symbol
         } else if let offset = a["offset"] as? String, a["symbol"] == nil,
@@ -120,22 +122,37 @@ rpc.exports = {
     const code = Process.findRangeByAddress(address.and(Process.arch === 'arm' ? ptr('0xfffffffe') : ptr('0xffffffffffffffff')));
     if (!code || !code.protection.includes('x')) throw new Error('Trace address is not executable');
     if (!c.symbol && (address.compare(m.base) < 0 || address.compare(m.base.add(m.size)) >= 0)) throw new Error('Offset is outside the module');
-    const hook = Interceptor.attach(address, {
-      onEnter(args) {
-        this.record = budget > 0;
-        if (!this.record) { lost++; return; }
-        budget--;
-        this.args = Array.from({length:c.count}, (_, i) => args[i].toString());
-        this.started = Date.now();
-      },
+    // Patching mid-instruction corrupts the target's code.
+    const bits = address.and(3).toInt32();
+    if ((Process.arch === 'arm64' && bits) || (Process.arch === 'arm' && bits === 2)) throw new Error('Trace address is not instruction-aligned' + (Process.arch === 'arm' ? '; set bit 0 for Thumb code' : ''));
+    // Frida patches up to 16 bytes; a second hook inside that patch restores corrupted code on detach.
+    const code0 = address.and(ptr('0xfffffffffffffffe'));
+    for (const [id, h] of hooks) {
+      const other = h.address.and(ptr('0xfffffffffffffffe'));
+      const near = code0.compare(other) > 0 ? code0.sub(other) : other.sub(code0);
+      if (!code0.equals(other) && near.compare(ptr(16)) < 0) throw new Error('Trace address is within 16 bytes of trace ' + id + '; remove it first');
+    }
+    // onLeave rewrites the return address, which corrupts control flow unless this is a function entry.
+    const entry = c.symbol || c.function_start || m.enumerateExports().some(e => e.address.equals(address));
+    const record = (ctx, args) => {
+      if (budget <= 0) { lost++; return false; }
+      budget--;
+      ctx.args = Array.from({length:c.count}, (_, i) => args[i].toString());
+      ctx.started = Date.now();
+      return true;
+    };
+    const hook = entry ? Interceptor.attach(address, {
+      onEnter(args) { this.record = record(this, args); },
       onLeave(retval) {
         if (this.record) send({event:'trace', id:c.id, thread:this.threadId, address:address.toString(), args:this.args, retval:retval.toString(), time:this.started});
       }
+    }) : Interceptor.attach(address, function (args) {
+      if (record(this, args)) send({event:'trace', id:c.id, thread:this.threadId, address:address.toString(), args:this.args, retval:null, time:this.started});
     });
-    hooks.set(c.id, hook);
-    return {id:c.id, address:address.toString()};
+    hooks.set(c.id, {hook, address});
+    return {id:c.id, address:address.toString(), retval:!!entry};
   },
-  remove(id) { if (!hooks.has(id)) throw new Error('Unknown trace id'); hooks.get(id).detach(); hooks.delete(id); }
+  remove(id) { if (!hooks.has(id)) throw new Error('Unknown trace id'); hooks.get(id).hook.detach(); hooks.delete(id); }
 };
 '''
 session = script = None

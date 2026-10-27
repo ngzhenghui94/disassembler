@@ -94,7 +94,11 @@ Server or Gadget yourself. `python_path` selects the interpreter; the default is
 `device`, or `port` for an existing localhost forward to Server/Gadget. It does not deploy a server or repackage apps.
 `frida_events` reports attachment and loaded modules. `frida_trace` adds a hook using `module` plus an exported
 `symbol` or hexadecimal `offset` from the loaded module base. Set `argument_count` from 0 to 8 to capture raw values.
-Trace events include thread ID, runtime address, arguments and return value when the call returns. Remove a hook
+Trace events include thread ID, runtime address, arguments and, at function entries, the return value. Hooking the
+return of a mid-function address can crash the target, so offsets that are neither exports nor functions in the open
+analysis are traced on entry only (`retval: null`) unless `function_start: true` is passed. Misaligned ARM addresses
+are rejected; give ARM32 Thumb code with bit 0 set. Traces must be at least 16 bytes apart (or at the same address),
+because Frida's patch covers up to 16 bytes and overlapping patches restore corrupted code on detach. Remove a hook
 with `action: "remove"` and its `id`; `frida_detach` removes hooks without killing the target. Poll for its completion.
 Frida does not provide instruction stepping here; use LLDB for that. Avoid simultaneous LLDB and Frida sessions
 on the same process because both can modify function instructions.

@@ -85,6 +85,7 @@ public final class LLDBSession: @unchecked Sendable {
             }
             self?.consume(d).forEach(onEvent)
         }
+        signal(SIGPIPE, SIG_IGN)   // a write after lldb exits must fail, not kill the host
         try process.run()
     }
 
