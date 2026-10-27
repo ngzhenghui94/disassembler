@@ -9,7 +9,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 BIN="$(swift build -c release --show-bin-path)"
 cp "$BIN/Disassembler" "$BIN/disasm-mcp" "$APP/Contents/MacOS/"   # disasm-mcp: REA provider (see README)
 cp Info.plist "$APP/Contents/"
-cp Resources/AppIcon.icns Resources/rea-ida-mcp.json "$APP/Contents/Resources/"
+cp Resources/AppIcon.icns Resources/rea-ida-mcp.json Resources/disassembler-mcp.json "$APP/Contents/Resources/"
 codesign --force --sign - "$APP"
 if [ "${1:-}" = "--install" ]; then
   rm -rf /Applications/Disassembler.app

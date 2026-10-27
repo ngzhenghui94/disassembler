@@ -45,8 +45,8 @@ open -a Disassembler --args /path/to/YourApp.app [/path/to/crash.ips]
 
 Debugging works for apps you build yourself; macOS doesn't allow attaching to hardened or system apps.
 
-Open an extracted Android `.so` with ⌘O, drag and drop, or the same terminal command above. Android files use
-static analysis: Run/Attach and macOS source-line lookup are unavailable. The 32-bit architectures show assembly;
+Open an extracted Android `.so` with ⌘O, drag and drop, or the same terminal command above. Use the Debug sidebar
+to attach to its Android process or launch its host executable through ADB. The 32-bit architectures show assembly;
 their pseudocode view explains this limitation. APK/AAR/JAR archives and ELF files with section headers removed
 are not supported. Stripped internal functions are recovered from direct calls where possible; missing symbols
 and ARM/Thumb mapping information can limit recovery. Standard ELF REL/RELA imports are read; Android packed
@@ -55,6 +55,63 @@ relocations are not expanded.
 The small Android test libraries are built from `Tests/DisasmCoreTests/Fixtures/android.c` and committed so
 `swift test` needs no Android toolchain. To regenerate them, run `sh Tests/DisasmCoreTests/Fixtures/build.sh`
 with Homebrew `lld` and `llvm` installed. Header parsing follows the [ELF specification](https://gabi.xinuos.com/elf/).
+
+## Android debugging and agent controls
+
+Agents can drive the bundled MCP server directly over stdio. Register this server alongside REA; REA's static
+analysis adapter does not expose the live debugging tools:
+
+```json
+{"mcpServers":{"disassembler":{"command":"/Applications/Disassembler.app/Contents/MacOS/disasm-mcp","args":[]}}}
+```
+
+The same registration is bundled as `Contents/Resources/disassembler-mcp.json`. All runtime tools have explicit
+input schemas. `android_targets` discovers devices and process IDs. Open the matching local `.so` with `idb_open`,
+then pass its returned `session_id` as `database` to subsequent calls (otherwise the latest analysis is selected).
+
+1. `debug_start`: use `android_attach` with `pid`, or `android_launch` with an absolute `remote_path` to the host
+   executable. Supply `server_path` to an Android NDK `lldb-server` matching the target ABI. The default is
+   `~/Library/Application Support/Disassembler/Tools/android-<arch>/lldb-server`. ADB is detected from Homebrew or
+   the standard Android SDK location; `adb_path` and `device` override it. `package` uses `run-as` for a debuggable app.
+2. `debug_state`: poll with `after` set to the last `cursor` and `wait_ms` up to 1000. Stops include registers,
+   variables, stack frames and addresses matching static analysis. `pc` in frames is a runtime address;
+   `fileAddr` belongs to the opened binary. Initial launch may stop in Android's linker; continue to the breakpoint.
+3. `debug_breakpoint`: set/remove symbol or hexadecimal file-address breakpoints. Set the same breakpoint with
+   `enabled: false` to disable it. Initial `breakpoints` can be supplied to `debug_start`.
+4. `debug_control`: continue, pause, step/next, stepi/nexti, finish, frame, stop or detach. `debug_memory` reads
+   a runtime address, register (`$pc`) or LLDB expression. Requests return IDs; poll for matching command/memory/error
+   events and new stop events. Acceptance means queued, not completed. `stop` kills only targets launched by this
+   session; attached targets are detached and resumed. Closing the analysis or MCP input also cleans up the session.
+
+The app's Debug sidebar uses these same engines. Android requires an authorized ADB connection and permission to
+debug the target: a process you own or a debuggable package. The app does not root devices or change security policy.
+It copies the process executable locally to let LLDB resolve its loader, deploys a temporary server, binds it to
+device loopback and removes its files and port forward on cleanup. Use the same library build as the running target.
+
+Frida adds native function tracing while the process runs. Install matching Frida Python bindings and Frida
+Server or Gadget yourself. `python_path` selects the interpreter; the default is
+`~/Library/Application Support/Disassembler/Tools/frida/bin/python3`. `frida_attach` takes a PID and optional USB
+`device`, or `port` for an existing localhost forward to Server/Gadget. It does not deploy a server or repackage apps.
+`frida_events` reports attachment and loaded modules. `frida_trace` adds a hook using `module` plus an exported
+`symbol` or hexadecimal `offset` from the loaded module base. Set `argument_count` from 0 to 8 to capture raw values.
+Trace events include thread ID, runtime address, arguments and return value when the call returns. Remove a hook
+with `action: "remove"` and its `id`; `frida_detach` removes hooks without killing the target. Poll for its completion.
+Frida does not provide instruction stepping here; use LLDB for that. Avoid simultaneous LLDB and Frida sessions
+on the same process because both can modify function instructions.
+
+Both event logs retain 200 events and report lost history with `dropped`. Frida permits 64 hooks and samples at most
+100 calls/second, reporting additional losses as `dropped` events. These are debugging traces, not a lossless profiler.
+No Java hooks, arbitrary injected scripts or APK repackaging are included. ARM64 has live device coverage; ARM32
+and x86 require their own matching servers and have only static-analysis test coverage here.
+
+An opt-in integration test compiles and deploys temporary native fixtures, checks MCP breakpoints/stepping/memory,
+safe detach and optionally Frida tracing, then removes its fixtures. It requires one ARM64 device, Xcode and Homebrew lld:
+
+```sh
+swift build --product disasm-mcp
+python3 scripts/test-android-runtime.py --server /path/to/android-arm64/lldb-server \
+  --gadget /path/to/frida-gadget-android-arm64.so --python /path/to/frida-venv/bin/python3
+```
 
 ## Using it from REA (reverse-engineer-anything)
 

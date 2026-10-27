@@ -29,8 +29,19 @@ public final class ProviderServer {
 
     var sessions: [String: Session] = [:]
     var order: [String] = []
+    var debuggers: [String: DebugController] = [:]
+    var tracers: [String: FridaSession] = [:]
 
     public init() {}
+
+    public func shutdown() {
+        debuggers.values.forEach { $0.terminate() }
+        debuggers.removeAll()
+        tracers.values.forEach { $0.terminate() }
+        tracers.removeAll()
+    }
+
+    deinit { shutdown() }
 
     /// Handles one JSON-RPC message; returns the response, or nil for notifications.
     public func handle(_ message: [String: Any]) -> [String: Any]? {
@@ -48,9 +59,9 @@ public final class ProviderServer {
         case "ping":
             return reply([:] as [String: Any])
         case "tools/list":
-            return reply(["tools": Self.tools.map {
+            return reply(["tools": (Self.tools + Self.runtimeTools).map {
                 ["name": $0.name, "description": $0.description,
-                 "inputSchema": ["type": "object", "additionalProperties": true] as [String: Any]] as [String: Any]
+                 "inputSchema": Self.runtimeSchema($0.name) ?? ["type": "object", "additionalProperties": true]] as [String: Any]
             }])
         case "tools/call":
             let name = params["name"] as? String ?? ""
@@ -78,6 +89,8 @@ public final class ProviderServer {
             }]
         case "idb_close":
             let s = try session(a)
+            debuggers.removeValue(forKey: s.id)?.terminate()
+            tracers.removeValue(forKey: s.id)?.terminate()
             sessions[s.id] = nil
             order.removeAll { $0 == s.id }
             return ["success": true, "session_id": s.id, "saved": false, "owned": true, "backend": "worker"] as [String: Any]
@@ -98,7 +111,9 @@ public final class ProviderServer {
         case "decompile": return try decompile(a)
         case "callees": return try callees(a)
         case "xrefs_to": return try xrefsTo(a)
-        default: throw MachOError(message: "Unknown tool \(name)")
+        default:
+            if Self.runtimeTools.contains(where: { $0.name == name }) { return try runtimeCall(name, a) }
+            throw MachOError(message: "Unknown tool \(name)")
         }
     }
 
@@ -114,6 +129,8 @@ public final class ProviderServer {
         #endif
         let analysis = try Analysis(slice: slice)
         let id = (a["preferred_session_id"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? UUID().uuidString
+        debuggers.removeValue(forKey: id)?.terminate()
+        tracers.removeValue(forKey: id)?.terminate()
         sessions[id] = Session(id: id, inputPath: path, analysis: analysis,
                                debugInfo: analysis.macho.isELF ? exe : SourceLines.debugInfo(for: exe, bundle: nil, uuid: analysis.macho.uuid))
         order.removeAll { $0 == id }

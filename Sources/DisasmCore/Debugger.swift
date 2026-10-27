@@ -1,6 +1,6 @@
 import Foundation
 
-public struct DebugFrame: Sendable, Decodable, Hashable {
+public struct DebugFrame: Sendable, Codable, Hashable {
     public let module: String
     public let function: String
     public let pc: UInt64
@@ -8,7 +8,7 @@ public struct DebugFrame: Sendable, Decodable, Hashable {
     public let line: String?       // "File.swift:42" when the frame has debug info
 }
 
-public struct DebugVariable: Sendable, Decodable, Hashable, Identifiable {
+public struct DebugVariable: Sendable, Codable, Hashable, Identifiable {
     public let id = UUID()
     public let name: String
     public let type: String
@@ -18,7 +18,7 @@ public struct DebugVariable: Sendable, Decodable, Hashable, Identifiable {
     enum CodingKeys: String, CodingKey { case name, type, value, children }
 }
 
-public struct DebugEvent: Sendable, Decodable {
+public struct DebugEvent: Sendable, Codable {
     public let event: String       // running | stopped | exited | output | error | memory
     public var reason: String?
     public var message: String?
@@ -32,6 +32,8 @@ public struct DebugEvent: Sendable, Decodable {
     public var breakpoint: String?   // our id of the breakpoint that was hit
     public var addr: String?         // memory: hex address that was read
     public var hex: String?          // memory: bytes as hex
+    public var requestID: String?
+    public var command: String?
 }
 
 /// What a breakpoint stops on. `id` is stable so the helper can find, toggle and delete it.
@@ -110,38 +112,46 @@ public final class LLDBSession: @unchecked Sendable {
         try? input.fileHandleForWriting.write(contentsOf: data)
     }
 
-    /// Closing stdin makes the helper kill the debuggee and exit.
+    /// Closing stdin detaches attached targets and stops targets launched by this session.
     public func terminate() {
         try? input.fileHandleForWriting.close()
     }
 
     static let script = #"""
-import sys, os, json, shlex, threading
+import sys, os, json, shlex, threading, subprocess, select, time, uuid, re, tempfile
 sys.path.insert(0, sys.argv[1])
 import lldb
 
 lock = threading.Lock()
 def emit(**kw):
     with lock:
-        sys.stdout.write(json.dumps(kw) + "\n")
-        sys.stdout.flush()
+        try:
+            sys.stdout.write(json.dumps(kw) + "\n")
+            sys.stdout.flush()
+        except BrokenPipeError:
+            pass
 
 dbg = lldb.SBDebugger.Create()
 dbg.SetAsync(True)
+dbg.SetInputFileHandle(open(os.devnull, "r"), True)
 listener = dbg.GetListener()
-st = {"target": None, "process": None, "module": None, "uuid": None, "path": None}
+st = {"target": None, "process": None, "module": None, "uuid": None, "path": None, "owned": False}
+remote = {}
+remote_lock = threading.RLock()
 bps = {}   # our id -> lldb breakpoint id
 LANGS = {"objc": lldb.eLanguageTypeObjC, "swift": lldb.eLanguageTypeSwift, "cpp": lldb.eLanguageTypeC_plus_plus}
 
 def file_addr(load):
     a = lldb.SBAddress(load, st["target"])
     m = a.GetModule()
-    if st["uuid"] and m.IsValid() and m.GetUUIDString() == st["uuid"]:
+    if m.IsValid() and ((st["uuid"] and m.GetUUIDString() == st["uuid"]) or m == st["module"]):
         return a.GetFileAddress()
     return None
 
 def find_module():
-    m = st["target"].FindModule(lldb.SBFileSpec(st["path"]))
+    matches = [m for m in st["target"].modules if (st["uuid"] and m.GetUUIDString() == st["uuid"]) or
+               (not st["uuid"] and m.GetFileSpec().GetFilename() == os.path.basename(st["path"]))]
+    m = matches[0] if len(matches) == 1 else st["target"].FindModule(lldb.SBFileSpec(st["path"]))
     if m.IsValid():
         st["module"], st["uuid"] = m, m.GetUUIDString()
         return True
@@ -210,7 +220,7 @@ def snapshot(selected=None):
          pc=file_addr(th.GetFrameAtIndex(0).GetPC()), frames=frames, selectedFrame=index,
          registers=regs, variables=variables, breakpoint=hit)
 
-def read_memory(p, expr, size):
+def read_memory(p, expr, size, request_id=None):
     f = p.GetSelectedThread().GetSelectedFrame()
     try:
         addr = int(expr, 0)
@@ -221,15 +231,15 @@ def read_memory(p, expr, size):
         else:
             v = f.EvaluateExpression(expr)
             if v.GetError().Fail():
-                emit(event="memory", message=v.GetError().GetCString() or "Can't evaluate " + expr)
+                emit(event="memory", requestID=request_id, message=v.GetError().GetCString() or "Can't evaluate " + expr)
                 return
             addr = v.GetValueAsUnsigned()
     err = lldb.SBError()
     data = p.ReadMemory(addr, size, err)
     if err.Fail():
-        emit(event="memory", addr="0x%x" % addr, message=err.GetCString())
+        emit(event="memory", requestID=request_id, addr="0x%x" % addr, message=err.GetCString())
     else:
-        emit(event="memory", addr="0x%x" % addr, hex=data.hex())
+        emit(event="memory", requestID=request_id, addr="0x%x" % addr, hex=data.hex())
 
 def drain():
     p = st["process"]
@@ -245,7 +255,7 @@ def events():
     while True:
         if not listener.WaitForEvent(1, ev) or not lldb.SBProcess.EventIsProcessEvent(ev):
             continue
-        if st["process"] is None:
+        if st["process"] is None or lldb.SBProcess.GetProcessFromEvent(ev).GetUniqueID() != st["process"].GetUniqueID():
             continue
         drain()
         if ev.GetType() & lldb.SBProcess.eBroadcastBitStateChanged:
@@ -258,14 +268,16 @@ def events():
                 emit(event="running")
             elif s in (lldb.eStateExited, lldb.eStateCrashed, lldb.eStateDetached):
                 p = st["process"]
-                emit(event="exited", code=p.GetExitStatus(), message=p.GetExitDescription() or "")
+                cleanup_remote(p.GetUniqueID())
+                emit(event="detached" if s == lldb.eStateDetached else "exited", code=p.GetExitStatus(), message=p.GetExitDescription() or "")
 
 threading.Thread(target=events, daemon=True).start()
 
 def new_target(path, arch):
     old = st["process"]
     if old is not None and old.IsValid():
-        old.Kill()
+        old.Kill() if st["owned"] else old.Detach()
+    cleanup_remote()
     st.update(process=None, module=None, uuid=None)
     bps.clear()
     t = dbg.CreateTargetWithFileAndArch(path, arch) if path else dbg.CreateTarget("")
@@ -274,12 +286,127 @@ def new_target(path, arch):
     st["target"] = t
     return t
 
+def adb(args, data=None, check=True):
+    r = subprocess.run(remote["adb"] + args, input=data, stdin=subprocess.DEVNULL if data is None else None, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
+    if check and r.returncode:
+        raise Exception("ADB: " + r.stderr.decode(errors="replace").strip() + " " + r.stdout.decode(errors="replace").strip())
+    return r.stdout
+
+def shell(args, data=None, check=True):
+    return adb(["shell", shlex.join(remote.get("prefix", []) + args)], data, check)
+
+def cleanup_remote(process_id=None):
+    with remote_lock:
+        if process_id is not None and remote.get("process") != process_id:
+            return
+        _cleanup_remote()
+
+def _cleanup_remote():
+    if not remote:
+        return
+    if remote.get("forward"):
+        try: adb(["forward", "--remove", remote["forward"]], check=False)
+        except Exception: pass
+    helper = remote.get("helper")
+    if helper is not None:
+        helper.terminate()
+        try: helper.wait(timeout=3)
+        except subprocess.TimeoutExpired: helper.kill()
+    if remote.get("dir"):
+        try: shell(["rm", "-rf", remote["dir"]], check=False)
+        except Exception: pass
+    if remote.get("local"):
+        remote["local"].cleanup()
+    remote.clear()
+
+def android_start(c):
+    new_target(None, None)
+    st["path"], st["owned"] = c["module"], c["cmd"] == "android_launch"
+    remote["adb"] = [c["adb"]]
+    device = c.get("device", "")
+    devices = [line.split() for line in adb(["devices"]).decode().splitlines()[1:] if line.strip()]
+    if not device:
+        ready = [row[0] for row in devices if len(row) > 1 and row[1] == "device"]
+        if len(ready) != 1: raise Exception("Select exactly one authorized Android device with device=<serial>")
+        device = ready[0]
+    remote["adb"] += ["-s", device]
+    package = c.get("package", "")
+    remote["prefix"] = ["run-as", package] if package else []
+    # run-as enforces the application's debuggable flag and UID without changing device security.
+    if package: shell(["id"])
+    remote["dir"] = ("./cache/" if package else "/data/local/tmp/") + "disassembler-" + uuid.uuid4().hex
+    shell(["mkdir", "-m", "700", remote["dir"]])
+    server = remote["dir"] + "/lldb-server"
+    with open(c["server"], "rb") as f:
+        shell(["sh", "-c", "cat > " + shlex.quote(server)], f.read())
+    shell(["chmod", "700", server])
+    args = [server, "gdbserver", "--pipe", "1", "127.0.0.1:0"]
+    if st["owned"]:
+        args += ["--", c["remote_path"]] + shlex.split(c.get("args", ""))
+    else:
+        args += ["--attach", str(c["pid"])]
+    helper = subprocess.Popen(remote["adb"] + ["shell", shlex.join(remote["prefix"] + args)], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    remote["helper"] = helper
+    output = b""
+    deadline = time.monotonic() + 15
+    port = None
+    while time.monotonic() < deadline:
+        if select.select([helper.stdout], [], [], 0.1)[0]:
+            chunk = os.read(helper.stdout.fileno(), 4096)
+            if not chunk: break
+            output += chunk
+            match = re.search(rb"(?:^|\n)([0-9]{1,5})\x00", output)
+            if match:
+                port = int(match.group(1)); break
+        if helper.poll() is not None: break
+    if not port:
+        raise Exception("Android lldb-server did not start: " + output.decode(errors="replace")[-2000:])
+    local_port = int(adb(["forward", "tcp:0", "tcp:%d" % port]).strip())
+    remote["forward"] = "tcp:%d" % local_port
+    err = lldb.SBError()
+    triples = {"arm64": "aarch64-linux-android", "arm": "armv7-linux-androideabi", "x86": "i386-linux-android", "x86_64": "x86_64-linux-android"}
+    dbg.SetAsync(False)
+    executable = c["remote_path"] if st["owned"] else shell(["readlink", "/proc/%d/exe" % c["pid"]]).decode().strip()
+    remote["local"] = tempfile.TemporaryDirectory(prefix="disassembler-android-")
+    local_executable = os.path.join(remote["local"].name, os.path.basename(executable))
+    with open(local_executable, "wb") as f: f.write(shell(["cat", executable]))
+    t = dbg.CreateTarget(local_executable, triples[c["arch"]], "remote-linux", False, err)
+    t.GetModuleAtIndex(0).SetPlatformFileSpec(lldb.SBFileSpec(executable))
+    t.AddModule(c["module"], triples[c["arch"]], None)
+    if err.Fail() or not t.IsValid(): raise Exception("Can't create Android target: " + str(err))
+    st["target"] = t
+    find_module()
+    for spec in c.get("breakpoints", []): set_bp(spec)
+    with remote_lock:
+        st["process"] = t.ConnectRemote(listener, "connect://127.0.0.1:%d" % local_port, "gdb-remote", err)
+        remote["process"] = st["process"].GetUniqueID()
+    dbg.SetAsync(True)
+    if err.Fail(): raise Exception("Android connection failed: " + str(err))
+    find_module()
+    state = st["process"].GetState()
+    if state == lldb.eStateStopped:
+        snapshot()
+    elif state in (lldb.eStateExited, lldb.eStateCrashed, lldb.eStateDetached):
+        cleanup_remote(st["process"].GetUniqueID())
+        emit(event="detached" if state == lldb.eStateDetached else "exited", code=st["process"].GetExitStatus())
+
 def handle(c):
     cmd = c["cmd"]
     p = st["process"]
-    if cmd == "launch":
+    if cmd in ("memory", "frame", "step", "next", "stepi", "nexti", "finish") and (p is None or p.GetState() != lldb.eStateStopped):
+        raise Exception("This command requires a stopped process")
+    if cmd in ("android_launch", "android_attach"):
+        try: android_start(c)
+        except Exception:
+            p = st["process"]
+            if p is not None and p.IsValid(): p.Kill() if st["owned"] else p.Detach()
+            cleanup_remote()
+            dbg.SetAsync(True)
+            raise
+    elif cmd == "launch":
         st["path"] = c["module"]
         t = new_target(c["path"], c.get("arch"))
+        st["owned"] = True
         find_module()
         for spec in c.get("breakpoints", []):
             set_bp(spec)
@@ -293,6 +420,7 @@ def handle(c):
     elif cmd == "attach":
         st["path"] = c["module"]
         t = new_target(None, None)
+        st["owned"] = False
         err = lldb.SBError()
         st["process"] = t.AttachToProcessWithID(listener, c["pid"], err)
         if err.Fail():
@@ -311,9 +439,11 @@ def handle(c):
         if cmd not in ("bp_set", "bp_remove", "bp_enable"):
             emit(event="error", message="No process")
     elif cmd == "continue":
-        p.Continue()
+        err = p.Continue()
+        if err.Fail(): raise Exception(str(err))
     elif cmd == "pause":
-        p.Stop()
+        err = p.Stop()
+        if err.Fail(): raise Exception(str(err))
     elif cmd in ("stepi", "nexti"):
         p.GetSelectedThread().StepInstruction(cmd == "nexti")
     elif cmd in ("next", "step"):
@@ -326,22 +456,41 @@ def handle(c):
         th = p.GetSelectedThread()
         th.StepOutOfFrame(th.GetSelectedFrame())
     elif cmd == "frame":
+        if c["index"] >= p.GetSelectedThread().GetNumFrames(): raise Exception("Frame index is out of range")
         p.GetSelectedThread().SetSelectedFrame(c["index"])
         snapshot(selected=c["index"])
     elif cmd == "memory":
-        read_memory(p, c["expr"].strip(), c.get("size", 256))
+        read_memory(p, c["expr"].strip(), c.get("size", 256), c.get("requestID"))
+    elif cmd in ("detach", "stop"):
+        if cmd == "detach" or not st["owned"]:
+            err = p.Detach()
+            if err.Fail(): raise Exception(str(err))
+            result = "detached"
+        else:
+            err = p.Kill()
+            if err.Fail(): raise Exception(str(err))
+            result = "exited"
+        cleanup_remote()
+        st["process"] = None
+        emit(event=result, message="Stopped by client")
     elif cmd == "kill":
         p.Kill()
 
-for line in sys.stdin:
-    try:
-        handle(json.loads(line))
-    except Exception as e:
-        emit(event="error", message=str(e))
+try:
+    for line in sys.stdin:
+        c = {}
+        try:
+            c = json.loads(line)
+            handle(c)
+            if c.get("requestID"): emit(event="command", command=c["cmd"], requestID=c["requestID"])
+        except Exception as e:
+            emit(event="error", message=str(e), requestID=c.get("requestID"))
+finally:
+    p = st["process"]
+    if p is not None and p.IsValid():
+        p.Kill() if st["owned"] else p.Detach()
+    cleanup_remote()
 
-p = st["process"]
-if p is not None and p.IsValid():
-    p.Kill()
 os._exit(0)
 """#
 }

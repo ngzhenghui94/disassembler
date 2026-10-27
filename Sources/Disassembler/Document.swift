@@ -10,6 +10,7 @@ enum Destination: Hashable {
 
 /// Per-app launch options and the breakpoints that survive rebuilds (address breakpoints don't).
 struct DebugSettings: Codable, Equatable {
+    var android: AndroidDebugOptions?
     var arguments = ""
     var environment = ""             // KEY=VALUE per line
     var presets: Set<String> = []
@@ -45,7 +46,8 @@ final class Document {
     var slices: [ArchSlice] = []
     var arch = ""
     var analysis: Analysis?
-    var canDebug: Bool { analysis.map { !$0.macho.isELF } ?? false }
+    var canDebug: Bool { analysis != nil }
+    var isAndroid: Bool { analysis?.macho.isELF == true }
     var loading = false
     var error: String?
     var showImporter = false
@@ -62,7 +64,15 @@ final class Document {
     var sourceHeaders: [UInt64: [UInt64: SourceHeader]] = [:]   // function start -> first instruction of each source line
     private var sourceFiles: [String: [Substring]] = [:]
 
-    var session: LLDBSession?
+    var session: DebugController?
+    var tracer: FridaSession?
+    var fridaPID = ""
+    var fridaPort = ""
+    var fridaDevice = ""
+    var fridaPython = ""
+    var fridaSymbol = ""
+    var fridaOutput = ""
+    var fridaCursor = 0
     private var sessionToken = UUID()
     var breakpoints: Set<UInt64> = []   // address breakpoints in the open binary
     var settings = DebugSettings() { didSet { saveSettings() } }
@@ -105,6 +115,7 @@ final class Document {
 
     func openBinary(_ exe: URL) {
         stopDebugging()
+        detachFrida()
         url = exe; error = nil; analysis = nil; destination = nil; history = []; slices = []
         breakpoints = []
         settings = Self.loadSettings(for: launchURL)
@@ -278,39 +289,77 @@ final class Document {
     }
 
     func launch() {
-        startSession(["cmd": "launch", "path": launchURL?.path ?? "", "args": settings.arguments, "env": settings.environmentEntries])
+        if isAndroid {
+            sidebarTab = .debug
+            startSession((settings.android ?? AndroidDebugOptions()).command(launch: true, arch: analysis?.macho.arch ?? ""))
+        } else { startSession(["mode": "launch"]) }
     }
 
     func attach() {
+        if isAndroid {
+            sidebarTab = .debug
+            startSession((settings.android ?? AndroidDebugOptions()).command(launch: false, arch: analysis?.macho.arch ?? ""))
+            return
+        }
         guard let pid = runningPID else {
             debugState = "\(launchURL?.lastPathComponent ?? "App") isn't running"
             return
         }
-        startSession(["cmd": "attach", "pid": Int(pid)])
+        startSession(["mode": "attach", "pid": Int(pid)])
     }
 
     private func startSession(_ command: [String: Any]) {
-        guard canDebug else {
-            debugState = "Android ELF libraries support static analysis only; they cannot run on macOS."
-            return
-        }
-        guard let module = url?.path else { return }
+        guard let module = url, let analysis else { return }
         stopDebugging()
         console = ""; debugState = "Starting…"
         do {
             let token = UUID()
             sessionToken = token
-            let s = try LLDBSession { [weak self] e in Task { @MainActor in self?.handle(e, token) } }
-            session = s
             var cmd = command
-            cmd["module"] = module
+            if !isAndroid { cmd["executable_path"] = launchURL?.path ?? module.path }
+            cmd["arguments"] = settings.arguments
+            cmd["environment"] = settings.environmentEntries
             cmd["breakpoints"] = allBreakpoints.map { $0.command(enabled: isEnabled($0)) }
-            if !arch.contains(" ") { cmd["arch"] = arch }
-            s.send(cmd)
+            session = try DebugController(options: cmd, module: module, analysis: analysis) { [weak self] e in
+                Task { @MainActor in self?.handle(e, token) }
+            }
         } catch {
             debugState = "Can't start lldb: \(error.localizedDescription)"
         }
     }
+
+    func attachFrida() {
+        do {
+            detachFrida()
+            var options: [String: Any] = ["pid": Int(fridaPID) ?? 0, "device": fridaDevice]
+            if !fridaPort.isEmpty { options["port"] = Int(fridaPort) ?? 0 }
+            if !fridaPython.isEmpty { options["python_path"] = fridaPython }
+            tracer = try FridaSession(options: options)
+            fridaOutput = "Connecting…"; fridaCursor = 0
+        } catch { fridaOutput = error.localizedDescription }
+    }
+
+    func traceFrida() {
+        guard let tracer, let url else { return }
+        do { _ = try tracer.trace(["module": url.lastPathComponent, "symbol": fridaSymbol]) }
+        catch { fridaOutput = error.localizedDescription }
+    }
+
+    func refreshFrida() {
+        guard let status = tracer?.status(after: fridaCursor) else { return }
+        fridaCursor = status["cursor"] as? Int ?? fridaCursor
+        if let events = status["events"] as? [[String: Any]], !events.isEmpty {
+            let lines = events.compactMap { item -> String? in
+                guard let event = item["event"] as? [String: Any] else { return nil }
+                if event["event"] as? String == "attached" { return "Attached. Ready to trace native exports." }
+                guard let data = try? JSONSerialization.data(withJSONObject: event, options: [.sortedKeys]) else { return nil }
+                return String(decoding: data, as: UTF8.self)
+            }
+            fridaOutput = (fridaOutput + "\n" + lines.joined(separator: "\n")).split(separator: "\n").suffix(100).joined(separator: "\n")
+        }
+    }
+
+    func detachFrida() { tracer?.terminate(); tracer = nil }
 
     func stopDebugging() {
         session?.terminate()
@@ -417,6 +466,8 @@ final class Document {
             } else {
                 memory = nil
             }
+        case "detached":
+            stopDebugging(); debugState = "Detached"
         case "exited":
             debugState = "Exited" + (e.code.map { " (status \($0))" } ?? "") + (e.message.map { $0.isEmpty ? "" : ": \($0)" } ?? "")
             isRunning = false; pc = nil

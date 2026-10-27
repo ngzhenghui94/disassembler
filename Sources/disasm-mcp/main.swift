@@ -11,3 +11,4 @@ while let line = readLine(strippingNewline: true) {
         FileHandle.standardOutput.write(out)
     }
 }
+server.shutdown()

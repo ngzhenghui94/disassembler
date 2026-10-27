@@ -135,11 +135,11 @@ struct ContentView: View {
             }
             ToolbarItem {
                 Button { doc.launch() } label: { Image(systemName: "play.fill") }
-                    .disabled(!doc.canDebug).help("Run a macOS binary under the debugger (⌘R)")
+                    .disabled(!doc.canDebug).help("Run the configured executable under the debugger (⌘R)")
             }
             ToolbarItem {
                 Button { doc.attach() } label: { Image(systemName: "link") }
-                    .disabled(!doc.canDebug).help("Attach to the running macOS app (⇧⌘R)")
+                    .disabled(!doc.canDebug).help("Attach to the configured process (⇧⌘R)")
             }
             ToolbarItem {
                 Button { doc.showImporter = true } label: { Image(systemName: "folder") }.help("Open a binary, .app or .ips crash report (⌘O)")
@@ -526,8 +526,31 @@ struct DebugSettingsSection: View {
     @Environment(Document.self) private var doc
     @State private var newSymbol = ""
 
+    private func android(_ key: WritableKeyPath<AndroidDebugOptions, String>) -> Binding<String> {
+        Binding(get: { (doc.settings.android ?? AndroidDebugOptions())[keyPath: key] }, set: {
+            var options = doc.settings.android ?? AndroidDebugOptions()
+            options[keyPath: key] = $0
+            doc.settings.android = options
+        })
+    }
+
     var body: some View {
         @Bindable var doc = doc
+        if doc.isAndroid {
+            Section("Android device") {
+                TextField("Device serial (automatic if one device)", text: android(\.device))
+                TextField("Debuggable package (optional run-as)", text: android(\.package))
+                TextField("PID to attach", text: android(\.pid))
+                TextField("Device executable path to launch", text: android(\.remotePath))
+                TextField("ADB path (automatic)", text: android(\.adbPath))
+                TextField("Android lldb-server path (ABI must match)", text: android(\.serverPath))
+                HStack {
+                    Button("Attach") { doc.attach() }
+                    Button("Launch") { doc.launch() }
+                }.buttonStyle(.borderless)
+                Text("Open the matching .so locally. Launch its host executable or attach to its process. Stop detaches attached processes.").font(.caption).foregroundStyle(.secondary).lineLimit(nil).fixedSize(horizontal: false, vertical: true)
+            }.textFieldStyle(.roundedBorder)
+        }
         Section("Breakpoints") {
             if doc.allBreakpoints.isEmpty {
                 Text("Click the circle beside an instruction, or add a function name below.").font(.caption).foregroundStyle(.secondary)
@@ -561,7 +584,7 @@ struct DebugSettingsSection: View {
                 }
         }
         Section("Stop when thrown") {
-            ForEach(["objc", "swift", "cpp"], id: \.self) { lang in
+            ForEach(doc.isAndroid ? ["cpp"] : ["objc", "swift", "cpp"], id: \.self) { lang in
                 Toggle(Document.exceptionLabels[lang] ?? lang, isOn: Binding(
                     get: { doc.settings.exceptions.contains(lang) },
                     set: { $0 ? doc.add(.exception(lang)) : doc.remove(.exception(lang)) }))
@@ -570,6 +593,7 @@ struct DebugSettingsSection: View {
         Section("Launch options") {
             TextField("Arguments", text: $doc.settings.arguments).textFieldStyle(.roundedBorder)
                 .help("Passed to the app when you run it. Quote arguments that contain spaces.")
+            if !doc.isAndroid {
             Text("Environment, one KEY=VALUE per line").font(.caption).foregroundStyle(.secondary)
             TextEditor(text: $doc.settings.environment)
                 .font(.caption.monospaced())
@@ -582,8 +606,29 @@ struct DebugSettingsSection: View {
                     set: { if $0 { doc.settings.presets.insert(preset.name) } else { doc.settings.presets.remove(preset.name) } }))
                     .help("\(preset.help) (\(preset.env))")
             }
+            }
             Text("Saved for this app. Takes effect the next time you run it (⌘R).").font(.caption).foregroundStyle(.secondary)
         }
+        Section("Frida native traces") {
+            TextField("PID", text: $doc.fridaPID)
+            TextField("Device ID (USB by default)", text: $doc.fridaDevice)
+            TextField("Local forwarded port (optional)", text: $doc.fridaPort)
+            TextField("Python with frida installed (automatic)", text: $doc.fridaPython)
+            HStack {
+                Button("Attach") { doc.attachFrida() }.disabled(doc.tracer != nil)
+                Button("Detach") { doc.detachFrida() }.disabled(doc.tracer == nil)
+            }.buttonStyle(.borderless)
+            TextField("Exported function in this library", text: $doc.fridaSymbol)
+            Button("Trace calls") { doc.traceFrida() }.buttonStyle(.borderless).disabled(doc.tracer == nil || doc.fridaSymbol.isEmpty)
+            Text("Requires Frida Server or Gadget. Captures raw arguments and return values; detach removes all traces. Agents can also trace module offsets through MCP.").font(.caption).foregroundStyle(.secondary).lineLimit(nil).fixedSize(horizontal: false, vertical: true)
+            if !doc.fridaOutput.isEmpty {
+                ScrollView([.horizontal, .vertical]) {
+                    Text(doc.fridaOutput).font(.caption.monospaced()).lineLimit(nil).fixedSize().textSelection(.enabled)
+                }.frame(height: 180)
+            }
+        }
+        .textFieldStyle(.roundedBorder)
+        .onReceive(Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()) { _ in doc.refreshFrida() }
     }
 }
 
