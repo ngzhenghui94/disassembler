@@ -1,8 +1,10 @@
 # Disassembler
 
-A Hopper-style macOS app for reading and debugging your own Mach-O apps.
+A Hopper-style macOS app for reading Mach-O apps and Android native libraries, with local debugging for macOS apps.
 
 - **Disassembly** of arm64/x86_64 Mach-O files, fat binaries and `.app` bundles (including their frameworks and plugins)
+- **Android `.so` libraries**: ELF assembly, procedures, imports, strings and sections for ARM64, ARMv7/Thumb,
+  x86_64 and x86, including stripped libraries. ARM64/x86_64 also support pseudocode and string cross-references.
 - **Procedures, imports, strings and cross-references**, with ADRP/selector/GOT references resolved
 - **Decompiler**: pseudo-C for any procedure (⌥↩), with recovered `if`/`else`, loops, `switch` statements
   from jump tables, call arguments (from known C/runtime signatures and each callee's own parameters),
@@ -22,7 +24,8 @@ move **Disassembler.app** to /Applications.
 
 ## Requirements
 
-macOS 14+ with Xcode (or the Command Line Tools) installed. Instruction decoding uses the system `otool`,
+macOS 14+ with Xcode (or the Command Line Tools) installed. Instruction decoding uses the system `otool` for Mach-O
+and `xcrun llvm-objdump` for ELF (no Android SDK is required),
 source lines use `atos`, and debugging uses LLDB's Python API.
 
 ## Build
@@ -41,6 +44,17 @@ open -a Disassembler --args /path/to/YourApp.app [/path/to/crash.ips]
 ```
 
 Debugging works for apps you build yourself; macOS doesn't allow attaching to hardened or system apps.
+
+Open an extracted Android `.so` with ⌘O, drag and drop, or the same terminal command above. Android files use
+static analysis: Run/Attach and macOS source-line lookup are unavailable. The 32-bit architectures show assembly;
+their pseudocode view explains this limitation. APK/AAR/JAR archives and ELF files with section headers removed
+are not supported. Stripped internal functions are recovered from direct calls where possible; missing symbols
+and ARM/Thumb mapping information can limit recovery. Standard ELF REL/RELA imports are read; Android packed
+relocations are not expanded.
+
+The small Android test libraries are built from `Tests/DisasmCoreTests/Fixtures/android.c` and committed so
+`swift test` needs no Android toolchain. To regenerate them, run `sh Tests/DisasmCoreTests/Fixtures/build.sh`
+with Homebrew `lld` and `llvm` installed. Header parsing follows the [ELF specification](https://gabi.xinuos.com/elf/).
 
 ## Using it from REA (reverse-engineer-anything)
 
@@ -62,4 +76,5 @@ What to expect:
 - `procedure_pseudo_code` returns the built-in decompiler's pseudo-C. When the build has debug info, the
   function's original source lines follow it as a commented trailer.
 - REA's headless profile doesn't offer direct callers; use `xrefs` on the function address instead.
-- Mach-O only (arm64 slice preferred on Apple silicon). Use another REA provider for ELF or PE files.
+- Mach-O (arm64 slice preferred on Apple silicon) and Android ELF `.so` libraries. Select `provider_id: "ida"`
+  explicitly for ELF targets. PE files are not supported.

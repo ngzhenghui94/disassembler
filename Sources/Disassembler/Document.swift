@@ -45,6 +45,7 @@ final class Document {
     var slices: [ArchSlice] = []
     var arch = ""
     var analysis: Analysis?
+    var canDebug: Bool { analysis.map { !$0.macho.isELF } ?? false }
     var loading = false
     var error: String?
     var showImporter = false
@@ -136,6 +137,7 @@ final class Document {
             case .success(let a):
                 analysis = a
                 destination = (a.macho.entry ?? a.functions.first?.start).map { .code($0) }
+                guard !a.macho.isELF else { return }
                 let uuid = a.macho.uuid
                 let info = await Task.detached { SourceLines.debugInfo(for: exe, bundle: bundle, uuid: uuid) }.value
                 if loadToken == token { debugInfo = info }
@@ -288,6 +290,10 @@ final class Document {
     }
 
     private func startSession(_ command: [String: Any]) {
+        guard canDebug else {
+            debugState = "Android ELF libraries support static analysis only; they cannot run on macOS."
+            return
+        }
         guard let module = url?.path else { return }
         stopDebugging()
         console = ""; debugState = "Starting…"

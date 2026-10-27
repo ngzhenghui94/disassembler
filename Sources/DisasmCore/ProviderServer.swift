@@ -14,7 +14,7 @@ public final class ProviderServer {
     }
 
     static let tools: [(name: String, description: String)] = [
-        ("idb_open", "Analyze a Mach-O file and register it as a session."),
+        ("idb_open", "Analyze a Mach-O or Android ELF library and register it as a session."),
         ("idb_list", "List open sessions."),
         ("idb_close", "Close a session."),
         ("server_health", "Report the session's input, image base and readiness."),
@@ -115,7 +115,7 @@ public final class ProviderServer {
         let analysis = try Analysis(slice: slice)
         let id = (a["preferred_session_id"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? UUID().uuidString
         sessions[id] = Session(id: id, inputPath: path, analysis: analysis,
-                               debugInfo: SourceLines.debugInfo(for: exe, bundle: nil, uuid: analysis.macho.uuid))
+                               debugInfo: analysis.macho.isELF ? exe : SourceLines.debugInfo(for: exe, bundle: nil, uuid: analysis.macho.uuid))
         order.removeAll { $0 == id }
         order.append(id)
         return ["success": true, "session": ["session_id": id, "input_path": path, "arch": slice.arch] as [String: Any]] as [String: Any]
@@ -196,6 +196,7 @@ public final class ProviderServer {
     /// The function's own source lines from debug info, as a trailer to the pseudocode, or nothing.
     func sourceListing(_ f: Function, _ s: Session) -> [String] {
         let a = s.analysis
+        guard !a.macho.isELF else { return [] }
         let found = SourceLines.lookup(a.instructions[f.lines].map(\.address), debugInfo: s.debugInfo,
                                        arch: a.macho.arch, loadAddress: a.macho.textBase)
         let byFile = Dictionary(grouping: found.values, by: \.file)
@@ -228,8 +229,9 @@ public final class ProviderServer {
             let stubs = Dictionary(an.imports.map { ($0.stub, $0.name) }, uniquingKeysWith: { x, _ in x })
             var seen = Set<UInt64>(), out: [[String: Any]] = []
             for i in an.instructions[f.lines] {
-                guard let t = i.target, !seen.contains(t) else { continue }
-                let isCall = i.mnemonic.hasPrefix("bl") || i.mnemonic.hasPrefix("call")
+                let isCall = Analysis.isCall(i.mnemonic)
+                let importedSlot = isCall ? i.dataRefs.first(where: { an.binds[$0] != nil }) : nil
+                guard let t = i.target ?? importedSlot, !seen.contains(t) else { continue }
                 if let name = stubs[t], isCall || i.mnemonic == "b" || i.mnemonic.hasPrefix("jmp") {
                     seen.insert(t)
                     out.append(["addr": hex(t), "name": name, "type": "external"])

@@ -79,6 +79,7 @@ extension FunctionDecompiler {
         guard let s = a.macho.section(containing: addr) else { return false }
         return s.segment == "__DATA_CONST" || s.segment == "__AUTH_CONST" || s.name == "__const"
             || ["__got", "__auth_got", "__auth_ptr", "__la_symbol_ptr", "__nl_symbol_ptr"].contains(s.name)
+            || (a.macho.isELF && [".got", ".got.plt"].contains(s.name))
             || (s.name.hasPrefix("__objc_") && s.name.hasSuffix("refs"))
     }
 

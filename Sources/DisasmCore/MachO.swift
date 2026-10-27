@@ -46,9 +46,10 @@ public struct Section: Sendable, Hashable {
     public let addr, size: UInt64
     public let offset, flags: UInt32
     public var reserved2: UInt32 = 0                         // stub size for symbol stub sections
+    public var isMapped: Bool = true
     public var isCode: Bool { flags & 0x8000_0000 != 0 }   // S_ATTR_PURE_INSTRUCTIONS
     public var isCString: Bool { flags & 0xff == 0x2 }       // S_CSTRING_LITERALS
-    public var fullName: String { "\(segment),\(name)" }
+    public var fullName: String { segment.isEmpty ? name : "\(segment),\(name)" }
 }
 
 public struct Symbol: Sendable, Hashable {
@@ -69,19 +70,26 @@ public struct MachO: Sendable {
     public private(set) var uuid: UUID?
     public private(set) var binds: [UInt64: String] = [:]   // pointer slot -> imported symbol (chained fixups)
     public private(set) var dataInCode: [(addr: UInt64, length: Int, fileOffset: Int)] = []   // jump tables etc. inside __text
+    var armModes: [UInt64: Bool] = [:]
     let reader: Reader
 
     public var data: Data { reader.data }
-    public var textBase: UInt64 { segments.first { $0.name == "__TEXT" }?.vmaddr ?? 0 }
+    public var isELF: Bool { data.starts(with: [0x7f, 0x45, 0x4c, 0x46]) }
+    public var supportsPseudocode: Bool { arch.hasPrefix("arm64") || arch == "x86_64" }
+    public var typeName: String {
+        (isELF ? [2: "Executable", 3: "Shared library"] : [2: "Executable", 6: "Dylib", 8: "Bundle"])[Int(fileType)] ?? "\(fileType)"
+    }
+    public var textBase: UInt64 { isELF ? segments.map(\.vmaddr).min() ?? 0 : segments.first { $0.name == "__TEXT" }?.vmaddr ?? 0 }
 
     /// Splits a fat file into slices; a thin file yields one slice.
     public static func slices(of data: Data) throws -> [ArchSlice] {
         let r = Reader(data: data)
+        if try r.u32(0) == 0x464c457f { return [ArchSlice(arch: try ELF.arch(r), data: data)] }
         let magic = UInt32(bigEndian: try r.u32(0))
         guard magic == 0xcafe_babe || magic == 0xcafe_babf else {
             let m = try r.u32(0)
             guard m == 0xfeed_facf else {
-                throw MachOError(message: m == 0xfeed_face ? "32-bit Mach-O is not supported" : "Not a Mach-O file")
+                throw MachOError(message: m == 0xfeed_face ? "32-bit Mach-O is not supported" : "Not a Mach-O or ELF file")
             }
             return [ArchSlice(arch: archName(try r.u32(4), try r.u32(8)), data: data)]
         }
@@ -136,6 +144,15 @@ public struct MachO: Sendable {
         let r = Reader(data: slice.data)
         reader = r
         arch = slice.arch
+        if try r.u32(0) == 0x464c457f {
+            let elf = try ELF(r)
+            guard arch == elf.arch else { throw MachOError(message: "ELF architecture does not match its slice") }
+            fileType = elf.fileType
+            segments = elf.segments; sections = elf.sections; symbols = elf.symbols
+            functionStarts = elf.functionStarts; entry = elf.entry; dylibs = elf.dylibs; binds = elf.binds
+            armModes = elf.armModes
+            return
+        }
         guard try r.u32(0) == 0xfeed_facf else { throw MachOError(message: "Only 64-bit Mach-O slices are supported") }
         fileType = try r.u32(12)
         let ncmds = Int(try r.u32(16))
@@ -283,7 +300,7 @@ public struct MachO: Sendable {
     }
 
     public func section(containing addr: UInt64) -> Section? {
-        sections.first { addr >= $0.addr && addr < $0.addr + $0.size }
+        sections.first { $0.isMapped && addr >= $0.addr && addr - $0.addr < $0.size }
     }
 
     /// Bytes at a VM address, if they are backed by file data.
@@ -294,7 +311,9 @@ public struct MachO: Sendable {
 
     /// Reads a pointer-sized value at a VM address, if it is backed by file data.
     func pointer(at addr: UInt64) -> UInt64? {
-        guard let seg = segments.first(where: { addr >= $0.vmaddr && addr - $0.vmaddr + 8 <= $0.filesize }) else { return nil }
-        return try? reader.u64(Int(truncatingIfNeeded: seg.fileoff &+ (addr - seg.vmaddr)))
+        let size: UInt64 = isELF && !supportsPseudocode ? 4 : 8
+        guard let seg = segments.first(where: { addr >= $0.vmaddr && addr - $0.vmaddr <= $0.filesize && size <= $0.filesize - (addr - $0.vmaddr) }) else { return nil }
+        let off = Int(truncatingIfNeeded: seg.fileoff &+ (addr - seg.vmaddr))
+        return try? size == 4 ? UInt64(reader.u32(off)) : reader.u64(off)
     }
 }

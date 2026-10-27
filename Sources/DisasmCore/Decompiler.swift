@@ -144,6 +144,7 @@ struct Block {
 public enum Decompiler {
     /// Pseudo-C for one function, one line per element.
     public static func decompile(_ a: Analysis, _ f: Function) -> [String] {
+        guard a.macho.supportsPseudocode else { return ["// Pseudocode is not available for \(a.macho.arch). Use Assembly to inspect this function."] }
         guard !f.lines.isEmpty else { return ["// \(f.name): no instructions"] }
         return FunctionDecompiler(a, f).run()
     }
@@ -592,7 +593,7 @@ final class FunctionDecompiler {
             return Signatures.known[pretty(raw)]
         }
         guard !light, callee.start != f.start else { return nil }
-        let key = "\(a.macho.uuid?.uuidString ?? "-")|\(a.macho.arch)|\(a.macho.data.count)|\(a.instructions.count)|\(addr)" as NSString
+        let key = "\(a.identity)|\(addr)" as NSString
         if let n = Self.parameterCache.object(forKey: key) { return (n.intValue, true) }
         let n = FunctionDecompiler(a, callee, light: true).prepare().paramCount
         Self.parameterCache.setObject(NSNumber(value: n), forKey: key)

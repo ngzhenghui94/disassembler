@@ -31,9 +31,9 @@ struct DisassemblerApp: App {
                 Button("Go to Address or Name…") { doc.gotoRequests += 1 }.keyboardShortcut("l").disabled(doc.analysis == nil)
             }
             CommandMenu("Debug") {
-                Button("Run") { doc.launch() }.keyboardShortcut("r").disabled(doc.analysis == nil)
+                Button("Run") { doc.launch() }.keyboardShortcut("r").disabled(!doc.canDebug)
                 Button("Attach to Running App") { doc.attach() }.keyboardShortcut("r", modifiers: [.command, .shift])
-                    .disabled(doc.analysis == nil)
+                    .disabled(!doc.canDebug)
                 Divider()
                 Button(doc.isRunning ? "Pause" : "Continue") { doc.send(doc.isRunning ? "pause" : "continue") }
                     .keyboardShortcut("y", modifiers: [.command, .control]).disabled(doc.session == nil)
@@ -135,11 +135,11 @@ struct ContentView: View {
             }
             ToolbarItem {
                 Button { doc.launch() } label: { Image(systemName: "play.fill") }
-                    .disabled(doc.analysis == nil).help("Run under the debugger (⌘R)")
+                    .disabled(!doc.canDebug).help("Run a macOS binary under the debugger (⌘R)")
             }
             ToolbarItem {
                 Button { doc.attach() } label: { Image(systemName: "link") }
-                    .disabled(doc.analysis == nil).help("Attach to the running app (⇧⌘R)")
+                    .disabled(!doc.canDebug).help("Attach to the running macOS app (⇧⌘R)")
             }
             ToolbarItem {
                 Button { doc.showImporter = true } label: { Image(systemName: "folder") }.help("Open a binary, .app or .ips crash report (⌘O)")
@@ -186,7 +186,7 @@ struct ContentView: View {
             }
         } else {
             ContentUnavailableView {
-                Label("Open a Mach-O binary, .app or crash report", systemImage: "cpu")
+                Label("Open a Mach-O binary, Android .so, .app or crash report", systemImage: "cpu")
             } description: {
                 Text("⌘O, or drop a file here. Your own debug builds keep their symbols.")
             } actions: {
@@ -330,7 +330,9 @@ struct InfoSection: View {
     var body: some View {
         Section("Binary") {
             LabeledContent("Architecture", value: macho.arch)
-            LabeledContent("Type", value: [2: "Executable", 6: "Dylib", 8: "Bundle"][macho.fileType] ?? "\(macho.fileType)")
+            LabeledContent("Format", value: macho.isELF ? "ELF" : "Mach-O")
+            LabeledContent("Type", value: macho.typeName)
+            if macho.isELF { Text("Static analysis only. Android libraries cannot run on macOS.").font(.caption).foregroundStyle(.secondary) }
             if let e = macho.entry { LabeledContent("Entry", value: hex(e)) }
             if let u = macho.uuid { LabeledContent("UUID", value: u.uuidString).textSelection(.enabled) }
             LabeledContent("Procedures", value: "\(analysis.functions.count)")

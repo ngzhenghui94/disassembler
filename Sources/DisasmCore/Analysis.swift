@@ -32,6 +32,7 @@ public struct Import: Sendable, Identifiable, Hashable {
 }
 
 public struct Analysis: Sendable {
+    let identity = UUID()
     public let macho: MachO
     public let instructions: [Instruction]
     public let functions: [Function]
@@ -59,6 +60,10 @@ public struct Analysis: Sendable {
             var start = 0
             for (i, b) in bytes.enumerated() where b == 0 {
                 if i > start {
+                    if macho.isELF && (i - start < 4 || !bytes[start..<i].allSatisfy({ $0 >= 32 && $0 < 127 || [9, 10, 13].contains($0) })) {
+                        start = i + 1
+                        continue
+                    }
                     strings.append(StringRef(address: sec.addr + UInt64(start),
                                              value: String(decoding: bytes[start..<i], as: UTF8.self), section: sec.name))
                 } else if i == 0 || bytes[i - 1] == 0 {
@@ -79,7 +84,23 @@ public struct Analysis: Sendable {
                 text.replaceSubrange(d.fileOffset..<d.fileOffset + d.length, with: repeatElement(0x90, count: d.length))
             }
         }
-        var ins = Self.parseOtool(try Self.otool(text), symbolAddress)
+        var ins: [Instruction]
+        var stubs: [UInt64: String] = [:]
+        if macho.isELF {
+            (ins, stubs) = try Self.disassembleELF(macho)
+            for i in ins.indices {
+                if let bytes = macho.bytes(at: ins[i].address, ins[i].bytes.count / 2) {
+                    let old = ins[i]
+                    ins[i] = Instruction(address: old.address, bytes: bytes.map { String(format: "%02x", $0) }.joined(),
+                                         mnemonic: old.mnemonic, operands: old.operands, comment: old.comment,
+                                         target: old.target, dataRefs: old.dataRefs)
+                }
+            }
+            // PLT entries are imports, not function bodies; don't infer their resolver's parameters.
+            ins.removeAll { macho.section(containing: $0.address)?.name.hasPrefix(".plt") == true }
+        } else {
+            ins = Self.parseOtool(try Self.otool(text), symbolAddress)
+        }
         // otool decodes jump tables in __text as (junk) instructions; the file marks them as data.
         if !macho.dataInCode.isEmpty {
             let ranges = macho.dataInCode.map { $0.addr..<($0.addr + UInt64($0.length)) }.sorted { $0.lowerBound < $1.lowerBound }
@@ -89,7 +110,6 @@ public struct Analysis: Sendable {
                 return r < ranges.count && ranges[r].contains(i.address)
             }
         }
-        var stubs: [UInt64: String] = [:]
         for i in ins where i.target != nil && i.comment.hasPrefix("symbol stub for: ") {
             stubs[i.target!] = String(i.comment.dropFirst("symbol stub for: ".count))
         }
@@ -98,7 +118,12 @@ public struct Analysis: Sendable {
         }
         let stubAddrs = Array(stubs.keys)
         for (addr, name) in zip(stubAddrs, Self.demangle(stubAddrs.map { stubs[$0]! })) { stubs[addr] = name }
-        imports = stubs.map { Import(name: $0.value, stub: $0.key) }.sorted { $0.name < $1.name }
+        var imported = stubs
+        if macho.isELF {
+            let stubNames = Set(stubs.values)
+            for (slot, name) in macho.binds where !stubNames.contains(name) { imported[slot] = name }
+        }
+        imports = imported.map { Import(name: $0.value, stub: $0.key) }.sorted { $0.name < $1.name }
         for (addr, name) in stubs where names[addr] == nil { names[addr] = name }
         let slots = Array(macho.binds.keys)
         binds = Dictionary(uniqueKeysWithValues: zip(slots, Self.demangle(slots.map { macho.binds[$0]! })))
@@ -111,13 +136,21 @@ public struct Analysis: Sendable {
         }
         if let e = macho.entry { starts.insert(e) }
         if let first = ins.first { starts.insert(first.address) }
+        if macho.isELF {
+            for sec in macho.sections where sec.isCode && !sec.name.hasPrefix(".plt") { starts.insert(sec.addr) }
+            for i in ins where Self.isCall(i.mnemonic) {
+                if let target = i.target, target != i.address + UInt64(i.bytes.count / 2),
+                   macho.section(containing: target)?.isCode == true, stubs[target] == nil { starts.insert(target) }
+            }
+        }
         let sortedStarts = starts.sorted()
         var functions: [Function] = []
         for (k, s) in sortedStarts.enumerated() {
             let lo = Self.lowerBound(ins, s)
-            let hi = k + 1 < sortedStarts.count ? Self.lowerBound(ins, sortedStarts[k + 1]) : ins.count
+            var hi = k + 1 < sortedStarts.count ? Self.lowerBound(ins, sortedStarts[k + 1]) : ins.count
+            if macho.isELF, let sec = macho.section(containing: s) { hi = min(hi, Self.lowerBound(ins, sec.addr + sec.size)) }
             guard lo < hi, ins[lo].address == s else { continue }
-            let end = hi < ins.count ? ins[hi].address : ins[hi - 1].address + UInt64(max(ins[hi - 1].bytes.count / 2, 1))
+            let end = macho.isELF || hi == ins.count ? ins[hi - 1].address + UInt64(max(ins[hi - 1].bytes.count / 2, 1)) : ins[hi].address
             functions.append(Function(name: names[s] ?? "sub_\(String(s, radix: 16))", start: s, end: end, lines: lo..<hi))
         }
         self.functions = functions
@@ -126,13 +159,14 @@ public struct Analysis: Sendable {
         for f in functions {
             var pages: [String: UInt64] = [:]   // register number -> ADRP page, reset per function
             for i in f.lines {
-                if isARM { Self.trackADRP(&ins[i], &pages) } else { Self.ripRelative(&ins[i]) }
+                if isARM { Self.trackADRP(&ins[i], &pages) } else if macho.arch == "x86_64" { Self.ripRelative(&ins[i]) }
             }
         }
 
         var xrefs: [UInt64: [UInt64]] = [:]
         for i in ins.indices {
             if let t = ins[i].target { xrefs[t, default: []].append(ins[i].address) }
+            if macho.isELF, let t = ins[i].target, let name = names[t] { ins[i].comment = name }
             guard let ref = ins[i].dataRefs.first else { continue }
             var resolved = [ref]
             if macho.section(containing: ref)?.name == "__cfstring" {
@@ -170,6 +204,80 @@ public struct Analysis: Sendable {
     }
 
     // MARK: - otool
+
+    static func disassembleELF(_ macho: MachO) throws -> ([Instruction], [UInt64: String]) {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("disasm-\(UUID().uuidString).so")
+        try macho.data.write(to: tmp)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        func decode(_ options: [String]) throws -> ([Instruction], [UInt64: String]) {
+            parseObjdump(try run("/usr/bin/xcrun", ["llvm-objdump", "--disassemble", "--print-imm-hex"] + options + [tmp.path]))
+        }
+        let normal = try decode([])
+        guard macho.arch == "arm", macho.armModes.values.contains(true) else { return normal }
+        // Stripping removes $t/$a mapping symbols; LLVM then defaults even exported Thumb functions to ARM.
+        let thumb = try decode(["--triple=thumbv7-linux-android"]).0
+        var modes = macho.armModes
+        var knownModes = Set(modes.keys)
+        for sec in macho.sections where sec.isCode {
+            let first = modes.keys.filter { $0 >= sec.addr && $0 - sec.addr < sec.size }.min()
+            modes[sec.addr] = sec.name.hasPrefix(".plt") ? false : first.flatMap { modes[$0] } ?? false
+        }
+        var result: [Instruction] = []
+        while true {
+            let boundaries = modes.keys.sorted()
+            func isThumb(_ address: UInt64) -> Bool {
+                var lo = 0, hi = boundaries.count
+                while lo < hi { let mid = (lo + hi) / 2; if boundaries[mid] <= address { lo = mid + 1 } else { hi = mid } }
+                return lo > 0 && modes[boundaries[lo - 1]] == true
+            }
+            result = (normal.0.filter { !isThumb($0.address) } + thumb.filter { isThumb($0.address) }).sorted { $0.address < $1.address }
+            var discovered: [UInt64: Bool] = [:]
+            for i in result where isCall(i.mnemonic) {
+                if let target = i.target, !knownModes.contains(target), macho.section(containing: target)?.isCode == true,
+                   normal.1[target] == nil {
+                    discovered[target] = i.mnemonic.hasPrefix("blx") ? !isThumb(i.address) : isThumb(i.address)
+                }
+            }
+            if discovered.isEmpty { break }
+            modes.merge(discovered) { _, inferred in inferred }
+            knownModes.formUnion(discovered.keys)
+        }
+        return (result, normal.1)
+    }
+
+    static func parseObjdump(_ text: String) -> ([Instruction], [UInt64: String]) {
+        var result: [Instruction] = [], imports: [UInt64: String] = [:]
+        for line in text.split(separator: "\n") {
+            if let marker = line.range(of: " <"), line.hasSuffix("@plt>:") {
+                if let addr = UInt64(line[..<marker.lowerBound], radix: 16) {
+                    imports[addr] = String(line[marker.upperBound...].dropLast(6))
+                }
+                continue
+            }
+            guard let colon = line.firstIndex(of: ":"),
+                  let addr = UInt64(line[..<colon].trimmingCharacters(in: .whitespaces), radix: 16) else { continue }
+            let parts = line[line.index(after: colon)...].split(separator: "\t", maxSplits: 2)
+            guard parts.count >= 2 else { continue }
+            let bytes = parts[0].filter { !$0.isWhitespace }
+            guard !bytes.isEmpty, bytes.allSatisfy(\.isHexDigit) else { continue }
+            let mnemonic = parts[1].trimmingCharacters(in: .whitespaces)
+            var operands = parts.count > 2 ? String(parts[2]) : ""
+            for marker in [" //", " # ", " @ ", " <"] {
+                if let r = operands.range(of: marker) { operands = String(operands[..<r.lowerBound]) }
+            }
+            operands = operands.trimmingCharacters(in: .whitespaces)
+            var i = Instruction(address: addr, bytes: bytes, mnemonic: mnemonic, operands: operands, comment: "",
+                                target: isBranch(mnemonic) ? branchTarget(operands, [:]) : nil)
+            // LLVM prints absolute ADR/ADRP destinations; otool's ADR is a displacement.
+            if mnemonic == "adr" || mnemonic == "adrp", let last = operands.split(separator: ",").last,
+               let target = imm(last) {
+                i.comment = "0x" + String(UInt64(bitPattern: target), radix: 16)
+                if mnemonic == "adr" { i.dataRefs = [UInt64(bitPattern: target)] }
+            }
+            result.append(i)
+        }
+        return (result.sorted { $0.address < $1.address }, imports)
+    }
 
     static func otool(_ data: Data) throws -> String {
         let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("disasm-\(UUID().uuidString)")
@@ -231,9 +339,19 @@ public struct Analysis: Sendable {
         return result
     }
 
+    static let armConditions: Set<Substring> = ["eq", "ne", "cs", "hs", "cc", "lo", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le", "al"]
+
+    static func isCall(_ m: String) -> Bool {
+        let base = m.split(separator: ".").first ?? ""
+        return base == "bl" || base == "blx" || base.hasPrefix("call")
+            || (base.hasPrefix("blx") && armConditions.contains(base.dropFirst(3)))
+            || (base.hasPrefix("bl") && armConditions.contains(base.dropFirst(2)))
+    }
+
     static func isBranch(_ m: String) -> Bool {
-        m == "b" || m == "bl" || m.hasPrefix("b.") || m.hasPrefix("bc.") || m.hasPrefix("cb") || m.hasPrefix("tb")
-            || m.hasPrefix("j") || m.hasPrefix("call")
+        let base = m.split(separator: ".").first ?? ""
+        return (base.hasPrefix("b") && armConditions.contains(base.dropFirst())) || isCall(m)
+            || m == "b" || m.hasPrefix("b.") || m.hasPrefix("bc.") || m.hasPrefix("cb") || m.hasPrefix("tb") || m.hasPrefix("j")
     }
 
     /// Last operand is either `0x…` or, when symbols exist, `name` / `name+0x…`.
@@ -296,7 +414,7 @@ public struct Analysis: Sendable {
     static func ripRelative(_ ins: inout Instruction) {
         guard let r = ins.operands.range(of: "(%rip)") else { return }
         let before = ins.operands[..<r.lowerBound]
-        let dispText = before.split(whereSeparator: { $0 == " " || $0 == "," || $0 == "$" }).last ?? "0"
+        let dispText = before.split(whereSeparator: { $0 == " " || $0 == "," || $0 == "$" || $0 == "*" }).last ?? "0"
         guard let disp = imm(dispText) else { return }
         let next = Int64(bitPattern: ins.address) &+ Int64(ins.bytes.count / 2)
         ins.dataRefs = [UInt64(bitPattern: next &+ disp)]
