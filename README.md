@@ -24,6 +24,12 @@ A Hopper-style macOS app for reading Mach-O apps, Android native libraries and W
 Get the notarized build from [Releases](https://github.com/ngzhenghui94/disassembler/releases/latest), unzip it and
 move **Disassembler.app** to /Applications.
 
+### 1.1.0
+
+Adds Windows x86-64 PE analysis and persistent typed signatures for procedures and imports.
+Also hardens malformed Mach-O handling, prevents stale document loads, and fixes LLDB startup-event
+ordering and incorrect SIMD zero recovery. See the format and signature limitations below.
+
 ## Requirements
 
 macOS 14+ with Xcode (or the Command Line Tools) installed. Instruction decoding uses the system `otool` for Mach-O
