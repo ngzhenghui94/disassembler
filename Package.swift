@@ -9,5 +9,6 @@ let package = Package(
         .executableTarget(name: "Disassembler", dependencies: ["DisasmCore"]),
         .executableTarget(name: "disasm-mcp", dependencies: ["DisasmCore"]),
         .testTarget(name: "DisasmCoreTests", dependencies: ["DisasmCore"], exclude: ["Fixtures"]),
+        .testTarget(name: "DisassemblerTests", dependencies: ["Disassembler", "DisasmCore"]),
     ]
 )

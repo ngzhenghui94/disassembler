@@ -20,7 +20,8 @@ func fixtureBinary(arch: String, strip: Bool, optimize: Bool = true) throws -> U
     """.write(to: src, atomically: true, encoding: .utf8)
     // Separate compile and link: debug info stays in t.o behind the binary's debug map, like an Xcode Debug build.
     _ = try Analysis.run("/usr/bin/xcrun", ["clang", "-g", optimize ? "-O1" : "-O0", "-arch", arch, "-c", src.path, "-o", dir.appendingPathComponent("t.o").path])
-    _ = try Analysis.run("/usr/bin/xcrun", ["clang", "-arch", arch, dir.appendingPathComponent("t.o").path, "-o", bin.path])
+    // atos caches by UUID; identical fixture code must not share another test's source paths.
+    _ = try Analysis.run("/usr/bin/xcrun", ["clang", "-arch", arch, "-Wl,-random_uuid", dir.appendingPathComponent("t.o").path, "-o", bin.path])
     if strip { _ = try Analysis.run("/usr/bin/xcrun", ["strip", bin.path]) }
     return bin
 }

@@ -9,23 +9,33 @@ public struct MachOError: Error, LocalizedError {
 struct Reader {
     let data: Data
 
-    func bytes(_ off: Int, _ len: Int) throws -> Data {
-        guard off >= 0, len >= 0, off <= data.count - len else {
+    @discardableResult
+    func range(_ off: Int, _ len: Int) throws -> Range<Int> {
+        guard off >= 0, len >= 0, off <= data.count, len <= data.count - off else {
             throw MachOError(message: "Truncated or malformed file (read \(len) bytes at 0x\(String(off, radix: 16)))")
         }
-        return data.subdata(in: off..<off + len)
+        return off..<off + len
     }
-    func u8(_ off: Int) throws -> UInt8 { try bytes(off, 1)[0] }
-    func u16(_ off: Int) throws -> UInt16 { try bytes(off, 2).withUnsafeBytes { $0.loadUnaligned(as: UInt16.self) } }
-    func u32(_ off: Int) throws -> UInt32 { try bytes(off, 4).withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) } }
-    func u64(_ off: Int) throws -> UInt64 { try bytes(off, 8).withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) } }
+    func bytes(_ off: Int, _ len: Int) throws -> Data {
+        data.subdata(in: try range(off, len))
+    }
+    private func value<T>(_ off: Int, as type: T.Type) throws -> T {
+        try range(off, MemoryLayout<T>.size)
+        return data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: off, as: type) }
+    }
+    func u8(_ off: Int) throws -> UInt8 { try value(off, as: UInt8.self) }
+    func u16(_ off: Int) throws -> UInt16 { try value(off, as: UInt16.self) }
+    func u32(_ off: Int) throws -> UInt32 { try value(off, as: UInt32.self) }
+    func u64(_ off: Int) throws -> UInt64 { try value(off, as: UInt64.self) }
     func fixedString(_ off: Int, _ len: Int) throws -> String {
-        String(decoding: try bytes(off, len).prefix { $0 != 0 }, as: UTF8.self)
+        String(decoding: data[try range(off, len)].prefix { $0 != 0 }, as: UTF8.self)
     }
-    func cString(_ off: Int) -> String {
-        guard off >= 0, off < data.count else { return "" }
-        let end = data[off...].firstIndex(of: 0) ?? data.count
-        return String(decoding: data[off..<end], as: UTF8.self)
+    func cString(_ off: Int, end: Int) throws -> String {
+        guard end <= data.count, off >= 0, off < end,
+              let nul = data[off..<end].firstIndex(of: 0) else {
+            throw MachOError(message: "Unterminated or out-of-range string")
+        }
+        return String(decoding: data[off..<nul], as: UTF8.self)
     }
 }
 
@@ -91,16 +101,21 @@ public struct MachO: Sendable {
             guard m == 0xfeed_facf else {
                 throw MachOError(message: m == 0xfeed_face ? "32-bit Mach-O is not supported" : "Not a Mach-O or ELF file")
             }
+            try r.range(0, 32)
             return [ArchSlice(arch: archName(try r.u32(4), try r.u32(8)), data: data)]
         }
         let is64 = magic == 0xcafe_babf
-        let count = Int(UInt32(bigEndian: try r.u32(4)))
+        let count = Int(UInt32(bigEndian: try r.u32(4))), stride = is64 ? 32 : 20
+        guard count > 0 else { throw MachOError(message: "Fat file has no architecture slices") }
+        try r.range(8, count * stride)
         var result: [ArchSlice] = []
-        for i in 0..<min(count, 64) {
-            let base = 8 + i * (is64 ? 32 : 20)
+        for i in 0..<count {
+            let base = 8 + i * stride
             let cpu = UInt32(bigEndian: try r.u32(base)), sub = UInt32(bigEndian: try r.u32(base + 4))
-            let off = is64 ? Int(truncatingIfNeeded: UInt64(bigEndian: try r.u64(base + 8))) : Int(UInt32(bigEndian: try r.u32(base + 8)))
-            let size = is64 ? Int(truncatingIfNeeded: UInt64(bigEndian: try r.u64(base + 16))) : Int(UInt32(bigEndian: try r.u32(base + 12)))
+            let offset = is64 ? UInt64(bigEndian: try r.u64(base + 8)) : UInt64(UInt32(bigEndian: try r.u32(base + 8)))
+            let length = is64 ? UInt64(bigEndian: try r.u64(base + 16)) : UInt64(UInt32(bigEndian: try r.u32(base + 12)))
+            guard let off = Int(exactly: offset), let size = Int(exactly: length), size >= 28,
+                  off >= 8 + count * stride else { throw MachOError(message: "Invalid fat slice range") }
             var name = archName(cpu, sub)
             if result.contains(where: { $0.arch == name }) { name += " #\(i + 1)" }
             result.append(ArchSlice(arch: name, data: try r.bytes(off, size)))
@@ -154,35 +169,76 @@ public struct MachO: Sendable {
             return
         }
         guard try r.u32(0) == 0xfeed_facf else { throw MachOError(message: "Only 64-bit Mach-O slices are supported") }
+        try r.range(0, 32)
         fileType = try r.u32(12)
-        let ncmds = Int(try r.u32(16))
+        let ncmds = Int(try r.u32(16)), commandsSize = Int(try r.u32(20))
+        let commandsEnd = try r.range(32, commandsSize).upperBound
+        guard ncmds <= commandsSize / 8 else { throw MachOError(message: "Load command count exceeds its table") }
         var off = 32
-        var symtab: (symoff: Int, nsyms: Int, stroff: Int)?
+        var symtab: (symoff: Int, nsyms: Int, stroff: Int, strsize: Int)?
         var starts: (off: Int, size: Int)?
         var entryOff: UInt64?
         var fixups: (off: Int, size: Int)?
         var dic: (off: Int, size: Int)?
         for _ in 0..<ncmds {
+            guard commandsEnd - off >= 8 else { throw MachOError(message: "Truncated load command") }
             let cmd = try r.u32(off), size = Int(try r.u32(off + 4))
-            guard size >= 8 else { throw MachOError(message: "Bad load command size") }
+            let minimum: Int
+            switch cmd {
+            case 0x19: minimum = 72
+            case 0x2, 0x8000_0028, 0xc, 0x8000_0018, 0x8000_001f, 0xd, 0x1b: minimum = 24
+            case 0x26, 0x29, 0x8000_0034: minimum = 16
+            default: minimum = 8
+            }
+            guard size >= minimum, size % 8 == 0, size <= commandsEnd - off else {
+                throw MachOError(message: "Bad load command size")
+            }
             switch cmd {
             case 0x19: // LC_SEGMENT_64
-                segments.append(Segment(name: try r.fixedString(off + 8, 16), vmaddr: try r.u64(off + 24),
-                                        vmsize: try r.u64(off + 32), fileoff: try r.u64(off + 40), filesize: try r.u64(off + 48)))
-                for s in 0..<Int(try r.u32(off + 64)) {
+                let seg = Segment(name: try r.fixedString(off + 8, 16), vmaddr: try r.u64(off + 24),
+                                  vmsize: try r.u64(off + 32), fileoff: try r.u64(off + 40), filesize: try r.u64(off + 48))
+                guard seg.vmsize <= UInt64.max - seg.vmaddr, seg.filesize <= UInt64.max - seg.vmaddr,
+                      seg.filesize <= UInt64.max - seg.fileoff else { throw MachOError(message: "Overflowing segment range") }
+                if seg.filesize > 0 {
+                    guard seg.fileoff <= UInt64(r.data.count), seg.filesize <= UInt64(r.data.count) - seg.fileoff else {
+                        throw MachOError(message: "Segment extends beyond file")
+                    }
+                }
+                segments.append(seg)
+                let nsects = Int(try r.u32(off + 64))
+                guard nsects <= (size - 72) / 80 else { throw MachOError(message: "Sections exceed their load command") }
+                for s in 0..<nsects {
                     let so = off + 72 + s * 80
-                    sections.append(Section(segment: try r.fixedString(so + 16, 16), name: try r.fixedString(so, 16),
-                                            addr: try r.u64(so + 32), size: try r.u64(so + 40),
-                                            offset: try r.u32(so + 48), flags: try r.u32(so + 64), reserved2: try r.u32(so + 72)))
+                    let sec = Section(segment: try r.fixedString(so + 16, 16), name: try r.fixedString(so, 16),
+                                      addr: try r.u64(so + 32), size: try r.u64(so + 40),
+                                      offset: try r.u32(so + 48), flags: try r.u32(so + 64), reserved2: try r.u32(so + 72))
+                    guard sec.size <= UInt64.max - sec.addr, sec.addr >= seg.vmaddr,
+                          sec.addr - seg.vmaddr <= seg.vmsize, sec.size <= seg.vmsize - (sec.addr - seg.vmaddr) else {
+                        throw MachOError(message: "Section exceeds its segment address range")
+                    }
+                    let kind = sec.flags & 0xff
+                    let zeroFill = kind == 1 || kind == 0xc || kind == 0x12
+                    if !zeroFill && sec.size > 0 {
+                        let fileOff = UInt64(sec.offset)
+                        guard fileOff >= seg.fileoff, fileOff - seg.fileoff <= seg.filesize,
+                              sec.size <= seg.filesize - (fileOff - seg.fileoff),
+                              fileOff <= UInt64(r.data.count), sec.size <= UInt64(r.data.count) - fileOff else {
+                            throw MachOError(message: "Section exceeds its segment file range")
+                        }
+                    }
+                    sections.append(sec)
                 }
             case 0x2: // LC_SYMTAB
-                symtab = (Int(try r.u32(off + 8)), Int(try r.u32(off + 12)), Int(try r.u32(off + 16)))
+                symtab = (Int(try r.u32(off + 8)), Int(try r.u32(off + 12)), Int(try r.u32(off + 16)), Int(try r.u32(off + 20)))
             case 0x26: // LC_FUNCTION_STARTS
                 starts = (Int(try r.u32(off + 8)), Int(try r.u32(off + 12)))
             case 0x8000_0028: // LC_MAIN
                 entryOff = try r.u64(off + 8)
             case 0xc, 0x8000_0018, 0x8000_001f, 0xd: // LC_LOAD_DYLIB, _WEAK_, LC_REEXPORT_DYLIB, LC_ID_DYLIB
-                if cmd != 0xd { dylibs.append(r.cString(off + Int(try r.u32(off + 8)))) }
+                let nameOff = Int(try r.u32(off + 8))
+                guard nameOff >= 24, nameOff < size else { throw MachOError(message: "Invalid dylib name offset") }
+                let name = try r.cString(off + nameOff, end: off + size)
+                if cmd != 0xd { dylibs.append(name) }
             case 0x1b: // LC_UUID
                 uuid = try r.bytes(off + 8, 16).withUnsafeBytes { UUID(uuid: $0.loadUnaligned(as: uuid_t.self)) }
             case 0x29: // LC_DATA_IN_CODE: { u32 fileoff, u16 length, u16 kind } entries
@@ -193,36 +249,55 @@ public struct MachO: Sendable {
             }
             off += size
         }
-        if let e = entryOff { entry = textBase + e }
+        guard off == commandsEnd else { throw MachOError(message: "Load commands do not fill their declared table") }
+        if let e = entryOff {
+            guard e <= UInt64.max - textBase else { throw MachOError(message: "Overflowing entry point") }
+            entry = textBase + e
+        }
         if let st = symtab {
+            try r.range(st.symoff, st.nsyms * 16)
+            let stringsEnd = try r.range(st.stroff, st.strsize).upperBound
             for i in 0..<st.nsyms {
                 let o = st.symoff + i * 16
                 let type = try r.u8(o + 4)
                 // Skip debug (N_STAB) entries; keep only symbols defined in a section (N_SECT).
                 guard type & 0xe0 == 0, type & 0x0e == 0x0e else { continue }
-                let name = r.cString(st.stroff + Int(try r.u32(o)))
+                let strx = Int(try r.u32(o))
+                guard strx != 0 else { continue } // n_strx == 0 denotes an unnamed symbol.
+                guard strx < st.strsize else { throw MachOError(message: "Symbol name exceeds its string table") }
+                let name = try r.cString(st.stroff + strx, end: stringsEnd)
                 if !name.isEmpty { symbols.append(Symbol(name: name, address: try r.u64(o + 8), section: Int(try r.u8(o + 5)))) }
             }
         }
         if let fs = starts {
             // ULEB128 deltas from the __TEXT segment start, zero-terminated.
+            let end = try r.range(fs.off, fs.size).upperBound
             var addr = textBase, i = fs.off, shift: UInt64 = 0, value: UInt64 = 0
-            while i < fs.off + fs.size {
+            var terminated = fs.size == 0
+            while i < end {
                 let b = try r.u8(i); i += 1
+                guard shift < 64, shift != 63 || b & 0x7e == 0 else { throw MachOError(message: "Overflowing function-start delta") }
                 value |= UInt64(b & 0x7f) << shift
-                if b & 0x80 != 0 { shift += 7; if shift > 63 { break }; continue }
-                if value == 0 { break }
-                addr &+= value
+                if b & 0x80 != 0 { shift += 7; continue }
+                if value == 0 { terminated = true; break }
+                guard value <= UInt64.max - addr else { throw MachOError(message: "Overflowing function-start address") }
+                addr += value
                 functionStarts.append(addr)
                 value = 0; shift = 0
             }
+            guard terminated else { throw MachOError(message: "Unterminated function starts") }
         }
-        if let fx = fixups { binds = (try? chainedBinds(fx.off)) ?? [:] }
+        if let fx = fixups { binds = try chainedBinds(fx.off, size: fx.size) }
         if let d = dic {
-            for i in 0..<min(d.size / 8, 1 << 20) {
-                guard let fileOff = try? r.u32(d.off + i * 8), let length = try? r.u16(d.off + i * 8 + 4),
-                      let seg = segments.first(where: { UInt64(fileOff) >= $0.fileoff && UInt64(fileOff) < $0.fileoff + $0.filesize }) else { continue }
-                dataInCode.append((seg.vmaddr + UInt64(fileOff) - seg.fileoff, Int(length), Int(fileOff)))
+            try r.range(d.off, d.size)
+            guard d.size % 8 == 0 else { throw MachOError(message: "Truncated data-in-code entry") }
+            for i in 0..<d.size / 8 {
+                let fileOff = UInt64(try r.u32(d.off + i * 8)), length = UInt64(try r.u16(d.off + i * 8 + 4))
+                guard let seg = segments.first(where: { fileOff >= $0.fileoff && fileOff - $0.fileoff <= $0.filesize && length <= $0.filesize - (fileOff - $0.fileoff) }),
+                      fileOff - seg.fileoff <= seg.vmsize, length <= seg.vmsize - (fileOff - seg.fileoff) else {
+                    throw MachOError(message: "Data-in-code range exceeds its segment")
+                }
+                dataInCode.append((seg.vmaddr + (fileOff - seg.fileoff), Int(length), Int(fileOff)))
             }
         }
     }
@@ -232,11 +307,13 @@ public struct MachO: Sendable {
         var result: [UInt64: UInt64] = [:]
         for sec in sections where sec.isCode && sec.name.hasSuffix("stubs") && sec.name != "__objc_stubs" && sec.reserved2 > 0 {
             let size = UInt64(sec.reserved2)
+            let kind = sec.flags & 0xff
+            guard size >= (arch == "x86_64" ? 6 : 8), kind != 1, kind != 0xc, kind != 0x12 else { continue }
             for k in 0..<min(sec.size / size, UInt64(data.count) / size) {   // size comes from the file
                 let addr = sec.addr + k * size, off = Int(sec.offset) + Int(k * size)
                 if arch == "x86_64" {   // jmp *disp32(%rip)
                     guard (try? reader.u16(off)) == 0x25ff, let disp = try? reader.u32(off + 2) else { continue }
-                    result[addr] = UInt64(bitPattern: Int64(bitPattern: addr + 6) &+ Int64(Int32(bitPattern: disp)))
+                    result[addr] = UInt64(bitPattern: Int64(bitPattern: addr &+ 6) &+ Int64(Int32(bitPattern: disp)))
                     continue
                 }
                 guard let w0 = try? reader.u32(off), let w1 = try? reader.u32(off + 4), w0 & 0x9f00_0000 == 0x9000_0000 else { continue }
@@ -244,51 +321,89 @@ public struct MachO: Sendable {
                 let imm = (Int64(Int32(bitPattern: pages << 11)) >> 11) << 12
                 let page = UInt64(bitPattern: Int64(bitPattern: addr & ~0xfff) &+ imm)
                 let imm12 = UInt64(w1 >> 10 & 0xfff)
-                if w1 & 0xffc0_0000 == 0x9100_0000 { result[addr] = page + imm12 }            // add x17, x17, #off
-                else if w1 & 0xffc0_0000 == 0xf940_0000 { result[addr] = page + imm12 * 8 }   // ldr x16, [x16, #off]
+                if w1 & 0xffc0_0000 == 0x9100_0000 { result[addr] = page &+ imm12 }            // add x17, x17, #off
+                else if w1 & 0xffc0_0000 == 0xf940_0000 { result[addr] = page &+ (imm12 * 8) }   // ldr x16, [x16, #off]
             }
         }
         return result
     }
 
     /// Walks every chain in LC_DYLD_CHAINED_FIXUPS and records which slots bind to which import.
-    /// shortcut: rebases are left to `Analysis.derefTarget`'s heuristic; 32-bit and firmware pointer formats are skipped.
-    func chainedBinds(_ base: Int) throws -> [UInt64: String] {
+    /// shortcut: rebases remain heuristic; unsupported chained encodings fail explicitly until a decoder is added.
+    func chainedBinds(_ base: Int, size: Int) throws -> [UInt64: String] {
         let r = reader
-        let startsOff = base + Int(try r.u32(base + 4)), importsOff = base + Int(try r.u32(base + 8))
-        let symbolsOff = base + Int(try r.u32(base + 12)), importsCount = Int(try r.u32(base + 16)), format = try r.u32(base + 20)
-        var names: [String] = []
-        for i in 0..<min(importsCount, 1 << 20) {
-            let nameOff: Int
-            switch format {
-            case 1: nameOff = Int(try r.u32(importsOff + i * 4) >> 9)
-            case 2: nameOff = Int(try r.u32(importsOff + i * 8) >> 9)
-            case 3: nameOff = Int(try r.u64(importsOff + i * 16) >> 32)
-            default: return [:]
+        let end = try r.range(base, size).upperBound
+        func checked(_ off: Int, _ length: Int) throws -> Int {
+            guard off >= base, off <= end, length >= 0, length <= end - off else {
+                throw MachOError(message: "Chained fixup data exceeds its payload")
             }
-            names.append(r.cString(symbolsOff + nameOff))
+            return off
         }
+        _ = try checked(base, 28)
+        guard try r.u32(base) == 0 else { throw MachOError(message: "Unsupported chained fixup version") }
+        let startsOffset = Int(try r.u32(base + 4))
+        let importsCount = Int(try r.u32(base + 16)), format = try r.u32(base + 20)
+        var names: [String] = []
+        if importsCount > 0 {
+            guard try r.u32(base + 24) == 0 else { throw MachOError(message: "Unsupported compressed chained symbols") }
+            let importsOff = try checked(base + Int(r.u32(base + 8)), 0)
+            let symbolsOff = try checked(base + Int(r.u32(base + 12)), 0)
+            guard importsOff >= base + 28, symbolsOff >= base + 28 else { throw MachOError(message: "Chained import table overlaps its header") }
+            let stride: Int
+            switch format {
+            case 1: stride = 4
+            case 2: stride = 8
+            case 3: stride = 16
+            default: throw MachOError(message: "Unsupported chained import format \(format)")
+            }
+            _ = try checked(importsOff, importsCount * stride)
+            for i in 0..<importsCount {
+                let nameOff = format == 3 ? Int(try r.u64(importsOff + i * stride) >> 32) : Int(try r.u32(importsOff + i * stride) >> 9)
+                names.append(try r.cString(checked(symbolsOff + nameOff, 1), end: end))
+            }
+        }
+        guard startsOffset != 0 else { return [:] }
+        guard startsOffset >= 28 else { throw MachOError(message: "Chained starts overlap their header") }
+        let startsOff = try checked(base + startsOffset, 4)
         var result: [UInt64: String] = [:]
         let segCount = Int(try r.u32(startsOff))
-        for s in 0..<min(segCount, segments.count) {
+        guard segCount <= segments.count else { throw MachOError(message: "Chained fixups reference missing segments") }
+        _ = try checked(startsOff + 4, segCount * 4)
+        for s in 0..<segCount {
             let infoOff = Int(try r.u32(startsOff + 4 + s * 4))
             guard infoOff != 0 else { continue }
-            let info = startsOff + infoOff
+            guard infoOff >= 4 + segCount * 4 else { throw MachOError(message: "Chained segment info overlaps its table") }
+            let info = try checked(startsOff + infoOff, 4)
+            let infoSize = Int(try r.u32(info))
+            guard infoSize >= 22 else { throw MachOError(message: "Truncated chained segment info") }
+            _ = try checked(info, infoSize)
             let pageSize = Int(try r.u16(info + 4)), ptrFormat = try r.u16(info + 6), pageCount = Int(try r.u16(info + 20))
-            let arm64e = [1, 9, 12].contains(ptrFormat), is64 = [2, 6].contains(ptrFormat)
-            guard arm64e || is64 else { continue }
+            guard pageCount <= (infoSize - 22) / 2, pageCount == 0 || pageSize >= 8 else {
+                throw MachOError(message: "Invalid chained fixup page table")
+            }
+            guard pageCount > 0 else { continue }
+            let arm64e = ptrFormat == 1 || ptrFormat == 9 || ptrFormat == 12
+            let is64 = ptrFormat == 2 || ptrFormat == 6
+            guard arm64e || is64 else { throw MachOError(message: "Unsupported chained pointer format \(ptrFormat)") }
             let seg = segments[s]
             for p in 0..<pageCount {
                 let start = try r.u16(info + 22 + p * 2)
                 guard start != 0xffff else { continue }
+                guard start & 0x8000 == 0 else { throw MachOError(message: "Unsupported multi-start chained fixup page") }
+                guard Int(start) < pageSize else { throw MachOError(message: "Chained fixup starts outside its page") }
+                let pageEnd = (p + 1) * pageSize
                 var offInSeg = p * pageSize + Int(start)
-                for _ in 0..<(pageSize / 4 + 1) {   // a chain can't be longer than its page
-                    guard UInt64(offInSeg) + 8 <= seg.filesize else { break }
+                while true {
+                    guard offInSeg <= pageEnd - 8, UInt64(offInSeg) <= seg.filesize, 8 <= seg.filesize - UInt64(offInSeg),
+                          UInt64(offInSeg) <= seg.vmsize, 8 <= seg.vmsize - UInt64(offInSeg) else {
+                        throw MachOError(message: "Chained pointer exceeds its page or segment")
+                    }
                     let v = try r.u64(Int(seg.fileoff) + offInSeg)
                     let isBind = arm64e ? v >> 62 & 1 == 1 : v >> 63 == 1
                     if isBind {
-                        let ordinal = Int(v & (ptrFormat == 1 ? 0xffff : 0xff_ffff))
-                        if ordinal < names.count { result[seg.vmaddr + UInt64(offInSeg)] = names[ordinal] }
+                        let ordinal = Int(v & (arm64e && ptrFormat != 12 ? 0xffff : 0xff_ffff))
+                        guard ordinal < names.count else { throw MachOError(message: "Chained bind ordinal exceeds imports") }
+                        result[seg.vmaddr + UInt64(offInSeg)] = names[ordinal]
                     }
                     let next = arm64e ? Int(v >> 51 & 0x7ff) * 8 : Int(v >> 51 & 0xfff) * 4
                     if next == 0 { break }
@@ -305,15 +420,18 @@ public struct MachO: Sendable {
 
     /// Bytes at a VM address, if they are backed by file data.
     public func bytes(at addr: UInt64, _ count: Int) -> Data? {
-        guard count >= 0, let seg = segments.first(where: { addr >= $0.vmaddr && addr - $0.vmaddr + UInt64(count) <= $0.filesize }) else { return nil }
-        return try? reader.bytes(Int(truncatingIfNeeded: seg.fileoff &+ (addr - seg.vmaddr)), count)
+        guard count >= 0, let seg = segments.first(where: { addr >= $0.vmaddr && addr - $0.vmaddr <= $0.filesize && UInt64(count) <= $0.filesize - (addr - $0.vmaddr) }) else { return nil }
+        let (offset, overflow) = seg.fileoff.addingReportingOverflow(addr - seg.vmaddr)
+        guard !overflow, let off = Int(exactly: offset) else { return nil }
+        return try? reader.bytes(off, count)
     }
 
     /// Reads a pointer-sized value at a VM address, if it is backed by file data.
     func pointer(at addr: UInt64) -> UInt64? {
         let size: UInt64 = isELF && !supportsPseudocode ? 4 : 8
         guard let seg = segments.first(where: { addr >= $0.vmaddr && addr - $0.vmaddr <= $0.filesize && size <= $0.filesize - (addr - $0.vmaddr) }) else { return nil }
-        let off = Int(truncatingIfNeeded: seg.fileoff &+ (addr - seg.vmaddr))
+        let (offset, overflow) = seg.fileoff.addingReportingOverflow(addr - seg.vmaddr)
+        guard !overflow, let off = Int(exactly: offset) else { return nil }
         return try? size == 4 ? UInt64(reader.u32(off)) : reader.u64(off)
     }
 }

@@ -138,7 +138,8 @@ dbg.SetInputFileHandle(open(os.devnull, "r"), True)
 listener = dbg.GetListener()
 st = {"target": None, "process": None, "module": None, "uuid": None, "path": None, "owned": False}
 remote = {}
-remote_lock = threading.RLock()
+# LLDB can emit startup events before launch/attach returns the process.
+state_lock = threading.RLock()
 bps = {}   # our id -> lldb breakpoint id
 LANGS = {"objc": lldb.eLanguageTypeObjC, "swift": lldb.eLanguageTypeSwift, "cpp": lldb.eLanguageTypeC_plus_plus}
 
@@ -256,21 +257,22 @@ def events():
     while True:
         if not listener.WaitForEvent(1, ev) or not lldb.SBProcess.EventIsProcessEvent(ev):
             continue
-        if st["process"] is None or lldb.SBProcess.GetProcessFromEvent(ev).GetUniqueID() != st["process"].GetUniqueID():
-            continue
-        drain()
-        if ev.GetType() & lldb.SBProcess.eBroadcastBitStateChanged:
-            s = lldb.SBProcess.GetStateFromEvent(ev)
-            if s == lldb.eStateStopped and not lldb.SBProcess.GetRestartedFromEvent(ev):
-                if st["module"] is None:
-                    find_module()
-                snapshot()
-            elif s == lldb.eStateRunning:
-                emit(event="running")
-            elif s in (lldb.eStateExited, lldb.eStateCrashed, lldb.eStateDetached):
-                p = st["process"]
-                cleanup_remote(p.GetUniqueID())
-                emit(event="detached" if s == lldb.eStateDetached else "exited", code=p.GetExitStatus(), message=p.GetExitDescription() or "")
+        with state_lock:
+            if st["process"] is None or lldb.SBProcess.GetProcessFromEvent(ev).GetUniqueID() != st["process"].GetUniqueID():
+                continue
+            drain()
+            if ev.GetType() & lldb.SBProcess.eBroadcastBitStateChanged:
+                s = lldb.SBProcess.GetStateFromEvent(ev)
+                if s == lldb.eStateStopped and not lldb.SBProcess.GetRestartedFromEvent(ev):
+                    if st["module"] is None:
+                        find_module()
+                    snapshot()
+                elif s == lldb.eStateRunning:
+                    emit(event="running")
+                elif s in (lldb.eStateExited, lldb.eStateCrashed, lldb.eStateDetached):
+                    p = st["process"]
+                    cleanup_remote(p.GetUniqueID())
+                    emit(event="detached" if s == lldb.eStateDetached else "exited", code=p.GetExitStatus(), message=p.GetExitDescription() or "")
 
 threading.Thread(target=events, daemon=True).start()
 
@@ -297,7 +299,7 @@ def shell(args, data=None, check=True):
     return adb(["shell", shlex.join(remote.get("prefix", []) + args)], data, check)
 
 def cleanup_remote(process_id=None):
-    with remote_lock:
+    with state_lock:
         if process_id is not None and remote.get("process") != process_id:
             return
         _cleanup_remote()
@@ -378,7 +380,7 @@ def android_start(c):
     st["target"] = t
     find_module()
     for spec in c.get("breakpoints", []): set_bp(spec)
-    with remote_lock:
+    with state_lock:
         st["process"] = t.ConnectRemote(listener, "connect://127.0.0.1:%d" % local_port, "gdb-remote", err)
         remote["process"] = st["process"].GetUniqueID()
     dbg.SetAsync(True)
@@ -482,15 +484,17 @@ try:
         c = {}
         try:
             c = json.loads(line)
-            handle(c)
+            with state_lock:
+                handle(c)
             if c.get("requestID"): emit(event="command", command=c["cmd"], requestID=c["requestID"])
         except Exception as e:
             emit(event="error", message=str(e), requestID=c.get("requestID"))
 finally:
-    p = st["process"]
-    if p is not None and p.IsValid():
-        p.Kill() if st["owned"] else p.Detach()
-    cleanup_remote()
+    with state_lock:
+        p = st["process"]
+        if p is not None and p.IsValid():
+            p.Kill() if st["owned"] else p.Detach()
+        cleanup_remote()
 
 os._exit(0)
 """#

@@ -116,6 +116,8 @@ final class Document {
     func openBinary(_ exe: URL) {
         stopDebugging()
         detachFrida()
+        loadToken = UUID()
+        loading = false; arch = ""; debugInfo = nil; sourceHeaders = [:]; sourceFiles = [:]
         url = exe; error = nil; analysis = nil; destination = nil; history = []; slices = []
         breakpoints = []
         settings = Self.loadSettings(for: launchURL)
@@ -139,7 +141,7 @@ final class Document {
         loadToken = token
         let bundle = bundleURL
         self.arch = arch; loading = true; analysis = nil; error = nil; destination = nil; history = []
-        debugInfo = nil; sourceHeaders = [:]
+        debugInfo = nil; sourceHeaders = [:]; sourceFiles = [:]
         Task {
             let result = await Task.detached(priority: .userInitiated) { Result { try Analysis(slice: slice) } }.value
             guard loadToken == token else { return }   // superseded by another open/arch switch
@@ -240,10 +242,11 @@ final class Document {
 
     func loadSource(for f: Function) async {
         guard sourceHeaders[f.start] == nil, let a = analysis, let info = debugInfo else { return }
+        let token = loadToken
         let addrs = a.instructions[f.lines].map(\.address)
         let arch = arch, base = a.macho.textBase
         let lines = await Task.detached { SourceLines.lookup(addrs, debugInfo: info, arch: arch, loadAddress: base) }.value
-        guard analysis?.macho.uuid == a.macho.uuid else { return }
+        guard loadToken == token else { return }
         var headers: [UInt64: SourceHeader] = [:]
         var previous: SourceLine?
         for addr in addrs {

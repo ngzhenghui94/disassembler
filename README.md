@@ -33,7 +33,7 @@ source lines use `atos`, and debugging uses LLDB's Python API.
 ```sh
 ./build.sh            # builds build/Disassembler.app
 ./build.sh --install  # also replaces /Applications/Disassembler.app
-swift test            # parser, crash report, source line, hex dump and LLDB tests
+swift test            # binary bounds, analysis, document reload, crash/source and LLDB tests
 scripts/release.sh    # Developer ID sign, notarize, staple, zip; add --publish for a GitHub release
 ```
 
@@ -55,6 +55,21 @@ relocations are not expanded.
 The small Android test libraries are built from `Tests/DisasmCoreTests/Fixtures/android.c` and committed so
 `swift test` needs no Android toolchain. To regenerate them, run `sh Tests/DisasmCoreTests/Fixtures/build.sh`
 with Homebrew `lld` and `llvm` installed. Header parsing follows the [ELF specification](https://gabi.xinuos.com/elf/).
+
+## Input validation and loading
+
+Mach-O parsing checks universal-binary tables, load-command boundaries, segment/section ranges,
+symbol strings, function-start deltas and chained-fixup payloads before using them. Empty architecture
+lists, truncated records and overflowing addresses return errors in both the app and MCP server.
+A failed MCP open leaves existing analysis sessions intact.
+
+Chained imports support formats 1–3 and pointer formats 1, 2, 6, 9 and 12. Unsupported nonempty
+encodings, compressed symbol tables and multi-start pages return explicit errors rather than silently
+omitting bindings. Chained rebasing remains heuristic.
+
+Opening or reloading a binary invalidates earlier analysis and source lookups and clears cached source
+text, so a failed open cannot be replaced by a previous file's delayed result. LLDB command handling and
+event processing are synchronized so startup breakpoint events wait until the process is registered.
 
 ## Android debugging and agent controls
 
