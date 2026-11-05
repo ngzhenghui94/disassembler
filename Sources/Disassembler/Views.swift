@@ -186,7 +186,7 @@ struct ContentView: View {
             }
         } else {
             ContentUnavailableView {
-                Label("Open a Mach-O binary, Android .so, .app or crash report", systemImage: "cpu")
+                Label("Open a Mach-O binary, Android .so, Windows .exe/.dll, .app or crash report", systemImage: "cpu")
             } description: {
                 Text("⌘O, or drop a file here. Your own debug builds keep their symbols.")
             } actions: {
@@ -330,9 +330,10 @@ struct InfoSection: View {
     var body: some View {
         Section("Binary") {
             LabeledContent("Architecture", value: macho.arch)
-            LabeledContent("Format", value: macho.isELF ? "ELF" : "Mach-O")
+            LabeledContent("Format", value: macho.isPE ? "PE" : macho.isELF ? "ELF" : "Mach-O")
             LabeledContent("Type", value: macho.typeName)
             if macho.isELF { Text("Static analysis only. Android libraries cannot run on macOS.").font(.caption).foregroundStyle(.secondary) }
+            if macho.isPE { Text("Static analysis only. Windows executables cannot run under the macOS debugger.").font(.caption).foregroundStyle(.secondary) }
             if let e = macho.entry { LabeledContent("Entry", value: hex(e)) }
             if let u = macho.uuid { LabeledContent("UUID", value: u.uuidString).textSelection(.enabled) }
             LabeledContent("Procedures", value: "\(analysis.functions.count)")
@@ -355,6 +356,7 @@ struct ProcedureView: View {
     let analysis: Analysis
     let function: Function
     let focus: UInt64
+    @State private var editingSignature = false
 
     var body: some View {
         let callers = analysis.xrefs[function.start] ?? []
@@ -364,6 +366,8 @@ struct ProcedureView: View {
                 HStack(alignment: .firstTextBaseline) {
                     Text(function.name).font(.headline.monospaced()).textSelection(.enabled).lineLimit(2)
                     Spacer()
+                    Button("Edit Signature…") { editingSignature = true }
+                        .disabled(!analysis.macho.supportsPseudocode)
                     Picker("", selection: $showPseudocode) {
                         Text("Assembly").tag(false)
                         Text("Pseudocode").tag(true)
@@ -374,6 +378,9 @@ struct ProcedureView: View {
                 }
                 Text("\(hex(function.start)) – \(hex(function.end)) · \(function.lines.count) instructions")
                     .font(.caption.monospaced()).foregroundStyle(.secondary)
+                if let error = doc.signatureError {
+                    Text("Saved signatures: \(error)").font(.caption).foregroundStyle(.red)
+                }
                 if !callers.isEmpty {
                     ScrollView(.horizontal) {
                         HStack {
@@ -394,6 +401,9 @@ struct ProcedureView: View {
             }
         }
         .task(id: "\(function.start)-\(doc.debugInfoReady)") { await doc.loadSource(for: function) }
+        .sheet(isPresented: $editingSignature) {
+            SignatureEditor(address: function.start, name: function.name, revision: doc.signatureRevision, signature: doc.signatures[function.start])
+        }
     }
 
     private func assembly(_ headers: [UInt64: SourceHeader]) -> some View {
@@ -412,6 +422,7 @@ struct ProcedureView: View {
 
 /// Decompiled pseudo-C for one procedure, computed off the main thread.
 struct PseudocodeView: View {
+    @Environment(Document.self) private var doc
     let analysis: Analysis
     let function: Function
     @State private var code: AttributedString?
@@ -431,10 +442,12 @@ struct PseudocodeView: View {
                 ProgressView("Decompiling…").frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .task(id: function.start) {
+        .task(id: "\(function.start)-\(doc.signatureRevision)") {
             code = nil
-            let (a, f) = (analysis, function)
-            code = await Task.detached { Self.highlight(Decompiler.decompile(a, f)) }.value
+            let (a, f, signatures) = (analysis, function, doc.signatures)
+            let rendered = await Task.detached { Self.highlight(Decompiler.decompile(a, f, signatures: signatures)) }.value
+            guard !Task.isCancelled else { return }
+            code = rendered
         }
     }
 
@@ -787,6 +800,7 @@ struct XrefsView: View {
     let analysis: Analysis
     let address: UInt64
     let title: String
+    @State private var editingSignature = false
 
     var body: some View {
         let refs = analysis.xrefs[address] ?? []
@@ -794,6 +808,10 @@ struct XrefsView: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text(title).font(.headline).textSelection(.enabled).lineLimit(3)
                 Text("\(hex(address)) · \(refs.count) references").font(.caption.monospaced()).foregroundStyle(.secondary)
+                if analysis.imports.contains(where: { $0.stub == address }) {
+                    Button("Edit Signature…") { editingSignature = true }
+                        .disabled(!analysis.macho.supportsPseudocode)
+                }
             }
             .padding(10)
             Divider()
@@ -818,6 +836,9 @@ struct XrefsView: View {
                 .listStyle(.plain)
                 .font(.system(.body, design: .monospaced))
             }
+        }
+        .sheet(isPresented: $editingSignature) {
+            SignatureEditor(address: address, name: title, revision: doc.signatureRevision, signature: doc.signatures[address])
         }
     }
 }

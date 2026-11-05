@@ -46,8 +46,12 @@ final class Document {
     var slices: [ArchSlice] = []
     var arch = ""
     var analysis: Analysis?
-    var canDebug: Bool { analysis != nil }
+    var canDebug: Bool { analysis.map { !$0.macho.isPE } ?? false }
     var isAndroid: Bool { analysis?.macho.isELF == true }
+    var signatures: [UInt64: FunctionSignature] = [:]
+    var signatureError: String?
+    var signatureRevision = UUID()
+    private var signatureStore: SignatureStore?
     var loading = false
     var error: String?
     var showImporter = false
@@ -118,6 +122,7 @@ final class Document {
         detachFrida()
         loadToken = UUID()
         loading = false; arch = ""; debugInfo = nil; sourceHeaders = [:]; sourceFiles = [:]
+        signatures = [:]; signatureError = nil
         url = exe; error = nil; analysis = nil; destination = nil; history = []; slices = []
         breakpoints = []
         settings = Self.loadSettings(for: launchURL)
@@ -142,15 +147,28 @@ final class Document {
         let bundle = bundleURL
         self.arch = arch; loading = true; analysis = nil; error = nil; destination = nil; history = []
         debugInfo = nil; sourceHeaders = [:]; sourceFiles = [:]
+        signatures = [:]; signatureError = nil
         Task {
-            let result = await Task.detached(priority: .userInitiated) { Result { try Analysis(slice: slice) } }.value
+            let result = await Task.detached(priority: .userInitiated) {
+                Result {
+                    let analysis = try Analysis(slice: slice)
+                    let store = SignatureStore(binary: analysis.macho)
+                    return (analysis, store, Result { try store.load(for: analysis) })
+                }
+            }.value
             guard loadToken == token else { return }   // superseded by another open/arch switch
             loading = false
             switch result {
-            case .success(let a):
+            case .success(let (a, store, saved)):
                 analysis = a
                 destination = (a.macho.entry ?? a.functions.first?.start).map { .code($0) }
-                guard !a.macho.isELF else { return }
+                signatureStore = store
+                switch saved {
+                case .success(let values): signatures = values
+                case .failure(let error): signatureError = error.localizedDescription
+                }
+                signatureRevision = UUID()
+                guard !a.macho.isELF, !a.macho.isPE else { return }
                 let uuid = a.macho.uuid
                 let info = await Task.detached { SourceLines.debugInfo(for: exe, bundle: bundle, uuid: uuid) }.value
                 if loadToken == token { debugInfo = info }
@@ -158,6 +176,18 @@ final class Document {
                 error = e.localizedDescription
             }
         }
+    }
+
+    func setSignature(_ signature: FunctionSignature?, at address: UInt64, revision: UUID) throws {
+        guard let analysis, let store = signatureStore, signatureRevision == revision else {
+            throw MachOError(message: "The selected binary has changed")
+        }
+        var latest = try store.load(for: analysis)
+        try store.save(signature, at: address, in: analysis)
+        latest[address] = signature
+        signatures = latest
+        signatureRevision = UUID()
+        signatureError = nil
     }
 
     func openCrash(_ file: URL) {
@@ -292,6 +322,7 @@ final class Document {
     }
 
     func launch() {
+        guard canDebug else { return }
         if isAndroid {
             sidebarTab = .debug
             startSession((settings.android ?? AndroidDebugOptions()).command(launch: true, arch: analysis?.macho.arch ?? ""))
@@ -299,6 +330,7 @@ final class Document {
     }
 
     func attach() {
+        guard canDebug else { return }
         if isAndroid {
             sidebarTab = .debug
             startSession((settings.android ?? AndroidDebugOptions()).command(launch: false, arch: analysis?.macho.arch ?? ""))

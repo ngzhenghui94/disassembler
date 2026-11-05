@@ -56,20 +56,33 @@ public struct Analysis: Sendable {
 
         var strings: [StringRef] = [], empty: [UInt64] = []   // "" is referenced (e.g. @"") but not worth listing
         for sec in macho.sections where sec.isCString {
-            guard let bytes = try? macho.reader.bytes(Int(sec.offset), Int(sec.size)) else { continue }
+            let size = macho.isPE ? min(sec.size, macho.segments.first { $0.vmaddr == sec.addr }?.filesize ?? 0) : sec.size
+            guard let bytes = try? macho.reader.bytes(Int(sec.offset), Int(size)) else { continue }
             var start = 0
             for (i, b) in bytes.enumerated() where b == 0 {
                 if i > start {
-                    if macho.isELF && (i - start < 4 || !bytes[start..<i].allSatisfy({ $0 >= 32 && $0 < 127 || [9, 10, 13].contains($0) })) {
+                    if (macho.isELF || macho.isPE) && (i - start < 4 || !bytes[start..<i].allSatisfy({ $0 >= 32 && $0 < 127 || [9, 10, 13].contains($0) })) {
                         start = i + 1
                         continue
                     }
                     strings.append(StringRef(address: sec.addr + UInt64(start),
                                              value: String(decoding: bytes[start..<i], as: UTF8.self), section: sec.name))
-                } else if i == 0 || bytes[i - 1] == 0 {
+                } else if !macho.isPE && (i == 0 || bytes[i - 1] == 0) {
                     empty.append(sec.addr + UInt64(i))
                 }
                 start = i + 1
+            }
+            if macho.isPE {
+                // Windows literals commonly use UTF-16LE; like the byte-string scan, list printable ASCII text.
+                var wideStart = 0
+                for i in stride(from: 0, to: bytes.count - 1, by: 2) {
+                    let lo = bytes[i], hi = bytes[i + 1]
+                    if lo == 0 && hi == 0, i - wideStart >= 8,
+                       let value = String(data: bytes.subdata(in: wideStart..<i), encoding: .utf16LittleEndian) {
+                        strings.append(StringRef(address: sec.addr + UInt64(wideStart), value: value, section: sec.name))
+                    }
+                    if hi != 0 || !(lo >= 32 && lo < 127 || [9, 10, 13].contains(lo)) { wideStart = i + 2 }
+                }
             }
         }
         self.strings = strings
@@ -86,8 +99,8 @@ public struct Analysis: Sendable {
         }
         var ins: [Instruction]
         var stubs: [UInt64: String] = [:]
-        if macho.isELF {
-            (ins, stubs) = try Self.disassembleELF(macho)
+        if macho.isELF || macho.isPE {
+            (ins, stubs) = try Self.disassembleLLVM(macho)
             for i in ins.indices {
                 if let bytes = macho.bytes(at: ins[i].address, ins[i].bytes.count / 2) {
                     let old = ins[i]
@@ -97,7 +110,18 @@ public struct Analysis: Sendable {
                 }
             }
             // PLT entries are imports, not function bodies; don't infer their resolver's parameters.
-            ins.removeAll { macho.section(containing: $0.address)?.name.hasPrefix(".plt") == true }
+            ins.removeAll {
+                guard let sec = macho.section(containing: $0.address) else { return true }
+                return !sec.isCode || (macho.isELF && sec.name.hasPrefix(".plt"))
+            }
+            if macho.isPE {
+                for i in ins.indices {
+                    Self.ripRelative(&ins[i])
+                    if ins[i].mnemonic.hasPrefix("jmp"), let slot = ins[i].dataRefs.first, let name = macho.binds[slot] {
+                        stubs[ins[i].address] = name
+                    }
+                }
+            }
         } else {
             ins = Self.parseOtool(try Self.otool(text), symbolAddress)
         }
@@ -123,6 +147,10 @@ public struct Analysis: Sendable {
             let stubNames = Set(stubs.values)
             for (slot, name) in macho.binds where !stubNames.contains(name) { imported[slot] = name }
         }
+        if macho.isPE {
+            imported = macho.binds
+            for (slot, name) in macho.binds where names[slot] == nil { names[slot] = name }
+        }
         imports = imported.map { Import(name: $0.value, stub: $0.key) }.sorted { $0.name < $1.name }
         for (addr, name) in stubs where names[addr] == nil { names[addr] = name }
         let slots = Array(macho.binds.keys)
@@ -136,7 +164,7 @@ public struct Analysis: Sendable {
         }
         if let e = macho.entry { starts.insert(e) }
         if let first = ins.first { starts.insert(first.address) }
-        if macho.isELF {
+        if macho.isELF || macho.isPE {
             for sec in macho.sections where sec.isCode && !sec.name.hasPrefix(".plt") { starts.insert(sec.addr) }
             for i in ins where Self.isCall(i.mnemonic) {
                 if let target = i.target, target != i.address + UInt64(i.bytes.count / 2),
@@ -148,9 +176,9 @@ public struct Analysis: Sendable {
         for (k, s) in sortedStarts.enumerated() {
             let lo = Self.lowerBound(ins, s)
             var hi = k + 1 < sortedStarts.count ? Self.lowerBound(ins, sortedStarts[k + 1]) : ins.count
-            if macho.isELF, let sec = macho.section(containing: s) { hi = min(hi, Self.lowerBound(ins, sec.addr + sec.size)) }
+            if macho.isELF || macho.isPE, let sec = macho.section(containing: s) { hi = min(hi, Self.lowerBound(ins, sec.addr + sec.size)) }
             guard lo < hi, ins[lo].address == s else { continue }
-            let end = macho.isELF || hi == ins.count ? ins[hi - 1].address + UInt64(max(ins[hi - 1].bytes.count / 2, 1)) : ins[hi].address
+            let end = macho.isELF || macho.isPE || hi == ins.count ? ins[hi - 1].address + UInt64(max(ins[hi - 1].bytes.count / 2, 1)) : ins[hi].address
             functions.append(Function(name: names[s] ?? "sub_\(String(s, radix: 16))", start: s, end: end, lines: lo..<hi))
         }
         self.functions = functions
@@ -166,7 +194,7 @@ public struct Analysis: Sendable {
         var xrefs: [UInt64: [UInt64]] = [:]
         for i in ins.indices {
             if let t = ins[i].target { xrefs[t, default: []].append(ins[i].address) }
-            if macho.isELF, let t = ins[i].target, let name = names[t] { ins[i].comment = name }
+            if macho.isELF || macho.isPE, let t = ins[i].target, let name = names[t] { ins[i].comment = name }
             guard let ref = ins[i].dataRefs.first else { continue }
             var resolved = [ref]
             if macho.section(containing: ref)?.name == "__cfstring" {
@@ -203,16 +231,16 @@ public struct Analysis: Sendable {
         return "0x" + String(addr, radix: 16)
     }
 
-    // MARK: - otool
+    // MARK: - Decoding
 
-    static func disassembleELF(_ macho: MachO) throws -> ([Instruction], [UInt64: String]) {
-        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("disasm-\(UUID().uuidString).so")
+    static func disassembleLLVM(_ macho: MachO) throws -> ([Instruction], [UInt64: String]) {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("disasm-\(UUID().uuidString).\(macho.isPE ? "exe" : "so")")
         try macho.data.write(to: tmp)
         defer { try? FileManager.default.removeItem(at: tmp) }
         func decode(_ options: [String]) throws -> ([Instruction], [UInt64: String]) {
             parseObjdump(try run("/usr/bin/xcrun", ["llvm-objdump", "--disassemble", "--print-imm-hex"] + options + [tmp.path]))
         }
-        let normal = try decode([])
+        let normal = try decode(macho.isPE ? ["--x86-asm-syntax=att"] : [])
         guard macho.arch == "arm", macho.armModes.values.contains(true) else { return normal }
         // Stripping removes $t/$a mapping symbols; LLVM then defaults even exported Thumb functions to ARM.
         let thumb = try decode(["--triple=thumbv7-linux-android"]).0

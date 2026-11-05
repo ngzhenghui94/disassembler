@@ -11,6 +11,7 @@ indirect enum Expr: Hashable {
     case c(Int64)
     case str(String)               // C string literal
     case global(String)            // address of a named symbol
+    case function(UInt64, String)   // edited call target retains its address even when symbol names alias
     case raw(String)               // pre-rendered text: @selector(…), class names, @"…"
     case bin(String, Expr, Expr)
     case un(String, Expr)          // - ~ ! &
@@ -130,6 +131,9 @@ struct ABI {
     static let x86_64 = ABI(args: ["rdi", "rsi", "rdx", "rcx", "r8", "r9"], ret: "rax",
                             clobbered: ["rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11"] + (0...15).map { "xmm\($0)" } + flags,
                             sp: "rsp", fp: "rbp", fpRet: "xmm0", otherRets: ["rdx", "xmm0", "xmm1"])
+    static let windowsX64 = ABI(args: ["rcx", "rdx", "r8", "r9"], ret: "rax",
+                               clobbered: ["rax", "rcx", "rdx", "r8", "r9", "r10", "r11"] + (0...5).map { "xmm\($0)" } + flags,
+                               sp: "rsp", fp: "rbp", fpRet: "xmm0", otherRets: ["xmm0"])
 }
 
 struct Block {
@@ -143,10 +147,21 @@ struct Block {
 
 public enum Decompiler {
     /// Pseudo-C for one function, one line per element.
-    public static func decompile(_ a: Analysis, _ f: Function) -> [String] {
+    public static func decompile(_ a: Analysis, _ f: Function, signatures: [UInt64: FunctionSignature] = [:]) -> [String] {
         guard a.macho.supportsPseudocode else { return ["// Pseudocode is not available for \(a.macho.arch). Use Assembly to inspect this function."] }
         guard !f.lines.isEmpty else { return ["// \(f.name): no instructions"] }
-        return FunctionDecompiler(a, f).run()
+        do {
+            for signature in signatures.values { try signature.validate(for: a.macho) }
+        } catch {
+            return ["// Invalid function signature: \(error.localizedDescription)"]
+        }
+        if !signatures.isEmpty {
+            let symbols = Set(a.names.values.map(pretty) + a.functions.map { pretty($0.name) } + a.imports.map { pretty($0.name) })
+            if let collision = signatures.values.lazy.flatMap(\.parameters).first(where: { symbols.contains($0.name) }) {
+                return ["// Invalid function signature: parameter '\(collision.name)' collides with an analyzed symbol."]
+            }
+        }
+        return FunctionDecompiler(a, f, signatures: signatures).run()
     }
 }
 
@@ -155,6 +170,8 @@ final class FunctionDecompiler {
     let f: Function
     let isARM: Bool
     let abi: ABI
+    let signatures: [UInt64: FunctionSignature]
+    var ownSignature: FunctionSignature? { signatures[f.start] }
     var blocks: [Block] = []
     var index: [UInt64: Int] = [:]
     var frameSaves = Set<UInt64>()
@@ -165,13 +182,14 @@ final class FunctionDecompiler {
     let extraLeaders: Set<UInt64>        // jump-table targets found by an earlier pass
     var missingLeaders = Set<UInt64>()
 
-    init(_ a: Analysis, _ f: Function, light: Bool = false, extraLeaders: Set<UInt64> = []) {
+    init(_ a: Analysis, _ f: Function, light: Bool = false, extraLeaders: Set<UInt64> = [], signatures: [UInt64: FunctionSignature] = [:]) {
         self.a = a
         self.f = f
         self.light = light
         self.extraLeaders = extraLeaders
+        self.signatures = signatures
         isARM = a.macho.arch.hasPrefix("arm64")
-        abi = isARM ? .arm64 : .x86_64
+        abi = isARM ? .arm64 : (a.macho.isPE ? .windowsX64 : .x86_64)
     }
 
     func run() -> [String] {
@@ -180,12 +198,15 @@ final class FunctionDecompiler {
         optimize()
         let recovered = recoverSwitches()
         let tailCalls = convertIndirectTailCalls(paramCount)
+        if tailCalls, ownSignature == nil {
+            returnsValue = blocks.contains { $0.stmts.contains { if case .ret(_?) = $0.kind { true } else { false } } }
+        }
         if recovered || tailCalls {
             // Case bodies are reachable now and tail calls read argument registers: either may read incoming
             // arguments nothing else did.
             let live = liveness(conservative: false).liveIn[0]
             let more = ((abi.args.indices.filter { live.contains(abi.args[$0]) }.max() ?? -1) + 1)
-            if more > paramCount {
+            if ownSignature == nil, more > paramCount {
                 blocks[0].stmts.insert(contentsOf: (paramCount..<more).map { Stmt(kind: .set(abi.args[$0], .v("arg\($0)"))) }, at: 0)
                 paramCount = more
             }
@@ -193,12 +214,14 @@ final class FunctionDecompiler {
         }
         if !missingLeaders.isEmpty, extraLeaders.isEmpty {
             // A case starts mid-block (C fallthrough): start over with the case addresses as block boundaries.
-            return FunctionDecompiler(a, f, extraLeaders: missingLeaders).run()
+            return FunctionDecompiler(a, f, extraLeaders: missingLeaders, signatures: signatures).run()
         }
         while simplifyCFG() { optimize() }
 
-        let args = (0..<paramCount).map { "int64_t arg\($0)" }.joined(separator: ", ")
-        var out = ["\(returnsValue ? "int64_t" : "void") \(pretty(f.name))(\(args)) {"]
+        let args = ownSignature.map { $0.parameters.map { "\($0.type.cName) \($0.name)" }.joined(separator: ", ") }
+            ?? (0..<paramCount).map { "int64_t arg\($0)" }.joined(separator: ", ")
+        let resultType = ownSignature?.returnType.cName ?? (returnsValue ? "int64_t" : "void")
+        var out = ["\(resultType) \(pretty(f.name))(\(ownSignature != nil && args.isEmpty ? "void" : args)) {"]
         out += structure()
         out.append("}")
         return out
@@ -219,10 +242,14 @@ final class FunctionDecompiler {
                 switch s.kind { case .set(r, _): true; case .asm: s.clobbers.contains(r); default: false }
             } }
         }
-        let tailCalls = blocks.contains { $0.stmts.contains { if case .ret(_?) = $0.kind { true } else { false } } }
+        let tailCalls = blocks.contains { $0.stmts.contains {
+            guard case .ret(let value?) = $0.kind else { return false }
+            if case .call(let target, _) = value, editedSignature(target)?.returnType == .void { return false }
+            return true
+        } }
         // A function that never writes x0/rax but computes into v0/xmm0 returns a float.
-        let retReg = !assigns(abi.ret) && assigns(abi.fpRet) ? abi.fpRet : abi.ret
-        let returnsValue = tailCalls || assigns(abi.ret) || assigns(abi.fpRet)
+        let retReg = ownSignature != nil ? abi.ret : (!assigns(abi.ret) && assigns(abi.fpRet) ? abi.fpRet : abi.ret)
+        let returnsValue = ownSignature.map { $0.returnType != .void } ?? (tailCalls || assigns(abi.ret) || assigns(abi.fpRet))
         for b in blocks.indices {
             for s in blocks[b].stmts.indices {
                 guard case .ret(nil) = blocks[b].stmts[s].kind else { continue }
@@ -230,11 +257,12 @@ final class FunctionDecompiler {
                 // The other result registers stay live so a struct or float result isn't deleted as dead: float ones
                 // when the function writes them at all, the integer second half only when set on the way out.
                 let setHere = Set(blocks[b].stmts[..<s].compactMap { st -> String? in if case .set(let n, _) = st.kind { n } else { nil } })
-                blocks[b].stmts[s].asmUses = abi.otherRets.filter { r in
+                blocks[b].stmts[s].asmUses = ownSignature == nil ? abi.otherRets.filter { r in
                     r != retReg && (r == abi.otherRets[0] ? setHere.contains(r) : assigns(r))
-                }
+                } : []
             }
         }
+        applyReturnSignature()
         if !blocks[0].preds.isEmpty {
             // The first block is a loop header: parameters must be read once, before the loop.
             blocks.insert(Block(start: f.start &- 1), at: 0)
@@ -242,9 +270,41 @@ final class FunctionDecompiler {
         }
         let entryLive = liveness(conservative: false).liveIn[0]
         let params = abi.args.indices.filter { entryLive.contains(abi.args[$0]) }
-        let paramCount = (params.max() ?? -1) + 1
+        let paramCount = ownSignature?.parameters.count ?? ((params.max() ?? -1) + 1)
         blocks[0].stmts.insert(contentsOf: (0..<paramCount).map { Stmt(kind: .set(abi.args[$0], .v("arg\($0)"))) }, at: 0)
         return (paramCount, returnsValue)
+    }
+
+    /// Preserve effects when a void declaration discards a tail-call result.
+    func applyReturnSignature() {
+        for b in blocks.indices {
+            blocks[b].stmts = blocks[b].stmts.flatMap { st -> [Stmt] in
+                guard case .ret(let value) = st.kind, let value else { return [st] }
+                let voidCall: Bool = if case .call(let target, _) = value { editedSignature(target)?.returnType == .void } else { false }
+                if ownSignature?.returnType == .void || voidCall {
+                    return (value.hasCall ? [Stmt(kind: .eval(value))] : []) + [Stmt(kind: .ret(nil))]
+                }
+                guard let type = ownSignature?.returnType else { return [st] }
+                var result = st
+                result.kind = .ret(coerce(value, to: type))
+                return [result]
+            }
+        }
+    }
+
+    func coerce(_ value: Expr, to type: FunctionType) -> Expr {
+        .fn("(\(type.cName))", [value])
+    }
+
+    func editedSignature(_ target: Expr) -> FunctionSignature? {
+        let address: UInt64?
+        switch target {
+        case .global(let name): address = calleeAddress[name] ?? uniqueAddress(of: name)
+        case .function(let value, _): address = value
+        case .c(let value): address = UInt64(bitPattern: value)
+        default: address = nil
+        }
+        return address.flatMap { signatures[$0] }
     }
 
     func buildBlocks(_ insns: [Instruction], _ lifted: [[Stmt]]) {
@@ -414,8 +474,19 @@ final class FunctionDecompiler {
             if matchJumpTable(simplify(e.map { if case .v(let n) = $0, let v = values[n] { v } else { $0 } })) != nil { continue }
             var defined = Set<Int>()
             for st in blocks[b].stmts { for d in st.defs { if let i = abi.args.firstIndex(of: d) { defined.insert(i) } } }
-            let k = max(defined.max() ?? -1, paramCount - 1)
-            blocks[b].stmts[blocks[b].stmts.count - 1].kind = .ret(.call(e, (0..<(k + 1)).map { .v(abi.args[$0]) }))
+            let edited = editedSignature(e)
+            let count = edited?.parameters.count ?? (max(defined.max() ?? -1, paramCount - 1) + 1)
+            var args = (0..<count).map { Expr.v(abi.args[$0]) }
+            if let edited { args = zip(args, edited.parameters).map { coerce($0.0, to: $0.1.type) } }
+            let call = Expr.call(e, args)
+            let last = blocks[b].stmts.count - 1
+            if ownSignature?.returnType == .void || edited?.returnType == .void {
+                blocks[b].stmts[last].kind = .eval(call)
+                blocks[b].stmts.append(Stmt(kind: .ret(nil)))
+            } else {
+                let result = edited.map { coerce(call, to: $0.returnType) } ?? call
+                blocks[b].stmts[last].kind = .ret(ownSignature.map { coerce(result, to: $0.returnType) } ?? result)
+            }
             changed = true
         }
         if changed { link() }
@@ -513,7 +584,8 @@ final class FunctionDecompiler {
                 default: target = nil
                 }
                 if let target {
-                    let known = objcArgCount(target, selector)
+                    let edited = editedSignature(target)
+                    let known = edited?.parameters.count ?? objcArgCount(target, selector)
                     var k = known.map { $0 - 1 } ?? max(defined.max() ?? -1, minArgs(target, selector) - 1)
                     if known == nil, let sig = signature(target) {
                         // A fixed signature is exact; variadic and inferred ones are a floor.
@@ -521,13 +593,21 @@ final class FunctionDecompiler {
                     }
                     var args = (0..<min(k + 1, abi.args.count)).map { Expr.v(abi.args[$0]) }
                     var n: Int64 = 0
-                    while let at = stackArgs[n * 8] {
+                    let shadowSpace: Int64 = a.macho.isPE && !isARM ? 32 : 0
+                    while edited == nil, let at = stackArgs[shadowSpace + n * 8] {
                         let name = "stack\(n)"
                         if case .set(_, let v) = blocks[b].stmts[at].kind { blocks[b].stmts[at].kind = .set(name, v) }
                         args.append(.v(name))
                         n += 1
                     }
-                    blocks[b].stmts[s] = st.mapExprs { if case .call(let t, []) = $0 { .call(t, args) } else { $0 } }
+                    if let edited {
+                        args = zip(args, edited.parameters).map { coerce($0.0, to: $0.1.type) }
+                    }
+                    blocks[b].stmts[s] = st.mapExprs {
+                        guard case .call(let t, []) = $0 else { return $0 }
+                        let call = Expr.call(t, args)
+                        return edited.map { $0.returnType == .void ? call : coerce(call, to: $0.returnType) } ?? call
+                    }
                     defined = []; selector = nil; stackArgs = [:]
                     continue
                 }
@@ -587,6 +667,7 @@ final class FunctionDecompiler {
 
     /// Argument count of a callee: a known C/runtime function, or what this decompiler infers for an internal one.
     func signature(_ t: Expr) -> (count: Int, variadic: Bool)? {
+        if let edited = editedSignature(t) { return (edited.parameters.count, false) }
         guard case .global(let raw) = t else { return nil }
         // A function defined in this binary is its own signature, even when it shares a libc name.
         guard let addr = calleeAddress[raw], addr != Self.ambiguous, let callee = a.function(containing: addr), callee.start == addr else {
@@ -594,9 +675,9 @@ final class FunctionDecompiler {
         }
         guard !light, callee.start != f.start else { return nil }
         let key = "\(a.identity)|\(addr)" as NSString
-        if let n = Self.parameterCache.object(forKey: key) { return (n.intValue, true) }
-        let n = FunctionDecompiler(a, callee, light: true).prepare().paramCount
-        Self.parameterCache.setObject(NSNumber(value: n), forKey: key)
+        if signatures.isEmpty, let n = Self.parameterCache.object(forKey: key) { return (n.intValue, true) }
+        let n = FunctionDecompiler(a, callee, light: true, signatures: signatures).prepare().paramCount
+        if signatures.isEmpty { Self.parameterCache.setObject(NSNumber(value: n), forKey: key) }
         return (n, true)   // inferred counts can miss pass-through arguments, so treat them as a floor
     }
 
@@ -690,7 +771,7 @@ final class FunctionDecompiler {
         let liveIn = liveness().liveIn[0]
         let constants = value.filter { r, e in
             guard defCount[r] == 1, isTemp(r), !liveIn.contains(r) else { return false }
-            switch e { case .c, .str, .raw, .global: return true; default: return false }
+            switch e { case .c, .str, .raw, .global, .function: return true; default: return false }
         }
         guard !constants.isEmpty else { return false }
         var changed = false
@@ -960,9 +1041,15 @@ final class FunctionDecompiler {
 
     // MARK: - Rendering
 
+    func variableName(_ name: String) -> String {
+        guard name.hasPrefix("arg"), let i = Int(name.dropFirst(3)),
+              let parameters = ownSignature?.parameters, parameters.indices.contains(i) else { return name }
+        return parameters[i].name
+    }
+
     func render(_ s: Stmt) -> String? {
         switch s.kind {
-        case .set(let n, let e): "\(n) = \(render(e));"
+        case .set(let n, let e): "\(variableName(n)) = \(render(e));"
         case .store(let addr, let v, let size): "\(render(.load(addr, size))) = \(render(v));"
         case .eval(let e): render(e) + ";"
         case .ret(let e): e.map { "return \(render($0));" } ?? "return;"
@@ -983,10 +1070,10 @@ final class FunctionDecompiler {
 
     func renderPrec(_ e: Expr) -> (String, Int) {
         switch e {
-        case .v(let n): return (n, 0)
+        case .v(let n): return (variableName(n), 0)
         case .c(let k): return (constant(k), k < 0 ? 2 : 0)
         case .str(let s): return (quote(s), 0)
-        case .global(let n): return ("&" + pretty(n), 2)
+        case .global(let n), .function(_, let n): return ("&" + pretty(n), 2)
         case .raw(let t): return (t, 0)
         case .un(let o, let x): return (o + wrap(x, 2), 2)
         case .fn(let n, let args): return (n + "(" + args.map(render).joined(separator: ", ") + ")", 0)
@@ -1014,6 +1101,7 @@ final class FunctionDecompiler {
     }
 
     func renderCall(_ t: Expr, _ args: [Expr]) -> String {
+        if case .function(_, let name) = t { return renderCall(.global(name), args) }
         if case .global(let raw) = t {
             let n = pretty(raw)
             if n.hasPrefix("objc_msgSend$"), let recv = args.first {

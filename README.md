@@ -1,10 +1,12 @@
 # Disassembler
 
-A Hopper-style macOS app for reading Mach-O apps and Android native libraries, with local debugging for macOS apps.
+A Hopper-style macOS app for reading Mach-O apps, Android native libraries and Windows x86-64 binaries, with local debugging for macOS apps.
 
 - **Disassembly** of arm64/x86_64 Mach-O files, fat binaries and `.app` bundles (including their frameworks and plugins)
 - **Android `.so` libraries**: ELF assembly, procedures, imports, strings and sections for ARM64, ARMv7/Thumb,
   x86_64 and x86, including stripped libraries. ARM64/x86_64 also support pseudocode and string cross-references.
+- **Windows `.exe` and `.dll` files**: PE32+ x86-64 assembly, exports, imports, strings, cross-references and pseudocode using the Windows calling convention
+- **Editable function signatures**: integer/pointer parameter types and names, return types and exact argument counts, saved for the binary and applied to callers
 - **Procedures, imports, strings and cross-references**, with ADRP/selector/GOT references resolved
 - **Decompiler**: pseudo-C for any procedure (⌥↩), with recovered `if`/`else`, loops, `switch` statements
   from jump tables, call arguments (from known C/runtime signatures and each callee's own parameters),
@@ -25,7 +27,7 @@ move **Disassembler.app** to /Applications.
 ## Requirements
 
 macOS 14+ with Xcode (or the Command Line Tools) installed. Instruction decoding uses the system `otool` for Mach-O
-and `xcrun llvm-objdump` for ELF (no Android SDK is required),
+and `xcrun llvm-objdump` for ELF and PE (no Android or Windows SDK is required for analysis),
 source lines use `atos`, and debugging uses LLDB's Python API.
 
 ## Build
@@ -55,6 +57,57 @@ relocations are not expanded.
 The small Android test libraries are built from `Tests/DisasmCoreTests/Fixtures/android.c` and committed so
 `swift test` needs no Android toolchain. To regenerate them, run `sh Tests/DisasmCoreTests/Fixtures/build.sh`
 with Homebrew `lld` and `llvm` installed. Header parsing follows the [ELF specification](https://gabi.xinuos.com/elf/).
+
+## Windows binaries
+
+Open a linked x86-64 PE32+ `.exe` or `.dll` with ⌘O or drag and drop. Analysis uses the preferred image-base
+addresses, normal imports and their IAT slots, exports, exception-table function starts and direct calls.
+Pseudocode uses Windows x64 argument registers and skips the 32-byte shadow space when recovering stack arguments.
+ASCII byte strings and ASCII text encoded as UTF-16LE are listed. Parsing validates file-backed RVA ranges;
+zero-filled sections are not mistaken for bytes in the file.
+
+This is static analysis, not Windows execution: Run/Attach are disabled for PE files. PE32/x86, ARM/ARM64 PE
+and COFF object files are unsupported. PDB types/source, managed .NET IL, delay imports, TLS callback discovery,
+resources and relocation application are not implemented. Forwarded exports have no local code address and
+are not listed as local functions. Function ends remain inferred. Packed binaries and indirect control flow
+can limit recovery; a directory spanning multiple mappings or a bound IAT without a lookup table is rejected.
+
+## Editing types and signatures
+
+Select a procedure and click **Edit Signature…**, or select an imported function in **Imports** and use the same
+button in its references view. Set the return type and add parameters in calling order. **Save** updates the
+definition and callers, including argument counts, typed casts and void-return behavior. **Use Inferred Signature**
+removes the override. Unknown imports often need an explicit signature to recover pass-through arguments correctly.
+These declarations are analyst input, not verified source types; a wrong declaration can make pseudocode misleading.
+
+Supported types are `void` (return only), signed/unsigned 8-, 16-, 32- and 64-bit integers, and `void *`.
+Editable parameters must fit the ABI's argument registers: eight on ARM64, six on SysV x86-64, four on Windows x64.
+Floating-point, structs, custom typedefs, variadic declarations and editable stack parameters are rejected/not offered.
+Parameter names must be unique C identifiers and cannot collide with symbols or reserved decompiler names.
+
+Overrides are atomic JSON files under `~/Library/Application Support/Disassembler/Signatures/`, keyed by the
+SHA-256 of the exact architecture slice. The input binary is never changed. Moving an identical binary retains
+its overrides; rebuilding it starts a separate set. UI and MCP share storage. MCP reloads overrides before
+decompiling; reopen the binary in an already-open UI window to pick up external edits.
+
+The MCP `function_signature` tool takes a function entry or import address and `action: "get"`, `"set"` or `"reset"`.
+For example, pass these tool arguments (use the address from the current analysis):
+
+```json
+{
+  "database": "your-session-id",
+  "addr": "0x140001000",
+  "action": "set",
+  "signature": {
+    "returnType": "int32",
+    "parameters": [{"name": "count", "type": "int32"}]
+  }
+}
+```
+
+MCP type names are `void`, `int8`, `uint8`, `int16`, `uint16`, `int32`, `uint32`, `int64`, `uint64`, `pointer`.
+Omit `signature` for `get`/`reset`. Signature changes invalidate cached pseudocode for all callers in the session.
+
 
 ## Input validation and loading
 
@@ -152,5 +205,5 @@ What to expect:
 - `procedure_pseudo_code` returns the built-in decompiler's pseudo-C. When the build has debug info, the
   function's original source lines follow it as a commented trailer.
 - REA's headless profile doesn't offer direct callers; use `xrefs` on the function address instead.
-- Mach-O (arm64 slice preferred on Apple silicon) and Android ELF `.so` libraries. Select `provider_id: "ida"`
-  explicitly for ELF targets. PE files are not supported.
+- Mach-O (arm64 slice preferred on Apple silicon), Android ELF `.so` libraries and Windows x86-64 PE32+ executables/DLLs.
+  Select `provider_id: "ida"` explicitly for ELF or PE targets.

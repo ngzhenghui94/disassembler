@@ -9,12 +9,14 @@ public final class ProviderServer {
         let inputPath: String
         let analysis: Analysis
         let debugInfo: URL
+        let signatureStore: SignatureStore
         var pseudocode: [UInt64: [String]] = [:]
         var regexMatches: [String: [StringRef]] = [:]
+        var signatures: [UInt64: FunctionSignature] = [:]
     }
 
     static let tools: [(name: String, description: String)] = [
-        ("idb_open", "Analyze a Mach-O or Android ELF library and register it as a session."),
+        ("idb_open", "Analyze a Mach-O, Android ELF library or Windows x86-64 PE binary and register it as a session."),
         ("idb_list", "List open sessions."),
         ("idb_close", "Close a session."),
         ("server_health", "Report the session's input, image base and readiness."),
@@ -22,6 +24,7 @@ public final class ProviderServer {
         ("lookup_funcs", "Resolve function names or addresses to their function."),
         ("find_regex", "Search strings in the binary with a regular expression."),
         ("decompile", "Decompile a function to pseudo-C; original source lines from debug info are appended when available."),
+        ("function_signature", "Get, set or reset a persistent typed function signature. Overrides affect this function and its callers without modifying the binary."),
         ("disasm", "Disassemble a function."),
         ("callees", "Functions and imports a function calls."),
         ("xrefs_to", "Code and data references to an address."),
@@ -61,7 +64,7 @@ public final class ProviderServer {
         case "tools/list":
             return reply(["tools": (Self.tools + Self.runtimeTools).map {
                 ["name": $0.name, "description": $0.description,
-                 "inputSchema": Self.runtimeSchema($0.name) ?? ["type": "object", "additionalProperties": true]] as [String: Any]
+                 "inputSchema": Self.signatureSchema($0.name) ?? Self.runtimeSchema($0.name) ?? ["type": "object", "additionalProperties": true]] as [String: Any]
             }])
         case "tools/call":
             let name = params["name"] as? String ?? ""
@@ -109,6 +112,7 @@ public final class ProviderServer {
         case "find_regex": return try findRegex(a)
         case "disasm": return try disasm(a)
         case "decompile": return try decompile(a)
+        case "function_signature": return try functionSignature(a)
         case "callees": return try callees(a)
         case "xrefs_to": return try xrefsTo(a)
         default:
@@ -128,11 +132,14 @@ public final class ProviderServer {
         let slice = slices.first { $0.arch == "x86_64" } ?? slices[0]
         #endif
         let analysis = try Analysis(slice: slice)
+        let signatureStore = SignatureStore(binary: analysis.macho)
+        let signatures = try signatureStore.load(for: analysis)
         let id = (a["preferred_session_id"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? UUID().uuidString
         debuggers.removeValue(forKey: id)?.terminate()
         tracers.removeValue(forKey: id)?.terminate()
         sessions[id] = Session(id: id, inputPath: path, analysis: analysis,
-                               debugInfo: analysis.macho.isELF ? exe : SourceLines.debugInfo(for: exe, bundle: nil, uuid: analysis.macho.uuid))
+                               debugInfo: analysis.macho.isELF || analysis.macho.isPE ? exe : SourceLines.debugInfo(for: exe, bundle: nil, uuid: analysis.macho.uuid),
+                               signatureStore: signatureStore, signatures: signatures)
         order.removeAll { $0 == id }
         order.append(id)
         return ["success": true, "session": ["session_id": id, "input_path": path, "arch": slice.arch] as [String: Any]] as [String: Any]
@@ -193,6 +200,11 @@ public final class ProviderServer {
 
     func decompile(_ a: [String: Any]) throws -> Any {
         var s = try session(a)
+        let signatures = try s.signatureStore.load(for: s.analysis)
+        if signatures != s.signatures {
+            s.signatures = signatures
+            s.pseudocode.removeAll()
+        }
         guard let addr = (a["addr"] as? String).flatMap(parseAddress), let f = s.analysis.function(containing: addr) else {
             return ["code": NSNull(), "error": "No function at \(a["addr"] ?? "?")", "cursor": ["done": true]] as [String: Any]
         }
@@ -200,7 +212,7 @@ public final class ProviderServer {
         if let cached = s.pseudocode[f.start] {
             lines = cached
         } else {
-            lines = Decompiler.decompile(s.analysis, f) + sourceListing(f, s)
+            lines = Decompiler.decompile(s.analysis, f, signatures: s.signatures) + sourceListing(f, s)
             s.pseudocode[f.start] = lines
             sessions[s.id] = s
         }
@@ -213,7 +225,7 @@ public final class ProviderServer {
     /// The function's own source lines from debug info, as a trailer to the pseudocode, or nothing.
     func sourceListing(_ f: Function, _ s: Session) -> [String] {
         let a = s.analysis
-        guard !a.macho.isELF else { return [] }
+        guard !a.macho.isELF, !a.macho.isPE else { return [] }
         let found = SourceLines.lookup(a.instructions[f.lines].map(\.address), debugInfo: s.debugInfo,
                                        arch: a.macho.arch, loadAddress: a.macho.textBase)
         let byFile = Dictionary(grouping: found.values, by: \.file)

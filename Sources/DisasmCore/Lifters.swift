@@ -67,7 +67,7 @@ extension FunctionDecompiler {
     /// What a pointer slot holds, when the file says: an imported symbol, a selector, a class or a local symbol/string.
     func slotTarget(_ slot: UInt64) -> Expr? {
         guard isConstantSlot(slot) else { return nil }
-        if let b = a.binds[slot] { return symbolValue(b) }
+        if let b = a.binds[slot] { return signatures[slot] != nil ? .function(slot, b) : symbolValue(b) }
         guard let t = Analysis.derefTarget(a.macho, slot, a.stringAt, a.names) else { return nil }
         if a.macho.section(containing: slot)?.name.contains("selref") == true, let s = a.stringAt[t] { return .raw("@selector(\(s))") }
         return addrExpr(t)
@@ -80,6 +80,7 @@ extension FunctionDecompiler {
         return s.segment == "__DATA_CONST" || s.segment == "__AUTH_CONST" || s.name == "__const"
             || ["__got", "__auth_got", "__auth_ptr", "__la_symbol_ptr", "__nl_symbol_ptr"].contains(s.name)
             || (a.macho.isELF && [".got", ".got.plt"].contains(s.name))
+            || (a.macho.isPE && a.binds[addr] != nil)
             || (s.name.hasPrefix("__objc_") && s.name.hasSuffix("refs"))
     }
 
@@ -95,11 +96,17 @@ extension FunctionDecompiler {
 
     func callee(_ t: UInt64) -> Expr {
         let name = a.name(of: t)
+        if signatures[t] != nil { return .function(t, name) }
         if let seen = calleeAddress[name], seen != t { calleeAddress[name] = Self.ambiguous } else { calleeAddress[name] = t }
         return .global(name)
     }
 
-    func call(_ t: Expr) -> Stmt { Stmt(kind: .set(abi.ret, .call(t, [])), clobbers: abi.clobbered.filter { $0 != abi.ret }) }
+    func call(_ t: Expr) -> Stmt {
+        if editedSignature(t)?.returnType == .void {
+            return Stmt(kind: .eval(.call(t, [])), clobbers: abi.clobbered)
+        }
+        return Stmt(kind: .set(abi.ret, .call(t, [])), clobbers: abi.clobbered.filter { $0 != abi.ret })
+    }
 
     func asm(_ ins: Instruction, defs: [String], uses: [String]) -> [Stmt] {
         let text = ins.operands.isEmpty ? ins.mnemonic : "\(ins.mnemonic) \(ins.operands)"
@@ -706,7 +713,8 @@ extension FunctionDecompiler {
             size = m.hasSuffix("ss") || m.hasSuffix("2ss") || m == "movd" ? 4 : 8
             guard ops.count == 2, let x = sseRead(ops[0], size) else { return fallback() }
             return write(ops[1], m.hasPrefix("sqrt") ? .fn("sqrt", [x]) : x) ?? fallback()
-        case "xorps", "xorpd" where ops.count == 2 && ops[0] == ops[1]:
+        case "xorps", "xorpd":
+            guard ops.count == 2, ops[0] == ops[1] else { return fallback() }
             return write(ops[1], .c(0)) ?? fallback()
         case "ucomiss", "ucomisd", "comiss", "comisd":
             guard ops.count == 2, let x = read(ops[1]), let y = read(ops[0]) else { return fallback() }
@@ -791,7 +799,7 @@ extension FunctionDecompiler {
 
     /// `jmp *slot(%rip)` through a GOT/stub slot is a tail call; `jmp *%reg` is usually a switch table.
     func isTailSlot(_ e: Expr) -> Bool {
-        switch e { case .global, .raw: true; case .load(.global, _): true; default: false }
+        switch e { case .global, .function, .raw: true; case .load(.global, _): true; default: false }
     }
 
     func loc(_ base: String?, _ index: String?, _ scale: Int64, _ disp: String) -> Loc? {

@@ -2,6 +2,7 @@ import Foundation
 
 public struct MachOError: Error, LocalizedError {
     public let message: String
+    public init(message: String) { self.message = message }
     public var errorDescription: String? { message }
 }
 
@@ -85,21 +86,24 @@ public struct MachO: Sendable {
 
     public var data: Data { reader.data }
     public var isELF: Bool { data.starts(with: [0x7f, 0x45, 0x4c, 0x46]) }
+    public var isPE: Bool { data.starts(with: [0x4d, 0x5a]) }
     public var supportsPseudocode: Bool { arch.hasPrefix("arm64") || arch == "x86_64" }
     public var typeName: String {
-        (isELF ? [2: "Executable", 3: "Shared library"] : [2: "Executable", 6: "Dylib", 8: "Bundle"])[Int(fileType)] ?? "\(fileType)"
+        if isPE { return fileType == 6 ? "DLL" : "Executable" }
+        return (isELF ? [2: "Executable", 3: "Shared library"] : [2: "Executable", 6: "Dylib", 8: "Bundle"])[Int(fileType)] ?? "\(fileType)"
     }
-    public var textBase: UInt64 { isELF ? segments.map(\.vmaddr).min() ?? 0 : segments.first { $0.name == "__TEXT" }?.vmaddr ?? 0 }
+    public var textBase: UInt64 { isELF || isPE ? segments.map(\.vmaddr).min() ?? 0 : segments.first { $0.name == "__TEXT" }?.vmaddr ?? 0 }
 
     /// Splits a fat file into slices; a thin file yields one slice.
     public static func slices(of data: Data) throws -> [ArchSlice] {
         let r = Reader(data: data)
         if try r.u32(0) == 0x464c457f { return [ArchSlice(arch: try ELF.arch(r), data: data)] }
+        if try r.u16(0) == 0x5a4d { return [ArchSlice(arch: try PE.arch(r), data: data)] }
         let magic = UInt32(bigEndian: try r.u32(0))
         guard magic == 0xcafe_babe || magic == 0xcafe_babf else {
             let m = try r.u32(0)
             guard m == 0xfeed_facf else {
-                throw MachOError(message: m == 0xfeed_face ? "32-bit Mach-O is not supported" : "Not a Mach-O or ELF file")
+                throw MachOError(message: m == 0xfeed_face ? "32-bit Mach-O is not supported" : "Not a Mach-O, ELF or Windows PE file")
             }
             try r.range(0, 32)
             return [ArchSlice(arch: archName(try r.u32(4), try r.u32(8)), data: data)]
@@ -159,6 +163,14 @@ public struct MachO: Sendable {
         let r = Reader(data: slice.data)
         reader = r
         arch = slice.arch
+        if try r.u16(0) == 0x5a4d {
+            let pe = try PE(r)
+            guard arch == pe.arch else { throw MachOError(message: "PE architecture does not match its slice") }
+            fileType = pe.fileType
+            segments = pe.segments; sections = pe.sections; symbols = pe.symbols
+            functionStarts = pe.functionStarts; entry = pe.entry; dylibs = pe.dylibs; binds = pe.binds
+            return
+        }
         if try r.u32(0) == 0x464c457f {
             let elf = try ELF(r)
             guard arch == elf.arch else { throw MachOError(message: "ELF architecture does not match its slice") }

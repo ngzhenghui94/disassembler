@@ -92,6 +92,7 @@ public final class DebugController: @unchecked Sendable {
     }
 
     static func startCommand(_ a: [String: Any], module: URL, analysis: Analysis) throws -> [String: Any] {
+        guard !analysis.macho.isPE else { throw MachOError(message: "Windows PE debugging is not supported on macOS") }
         guard let mode = a["mode"] as? String, ["launch", "attach", "android_launch", "android_attach"].contains(mode) else {
             throw MachOError(message: "mode must be launch, attach, android_launch or android_attach")
         }
